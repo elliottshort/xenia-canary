@@ -59,6 +59,60 @@ fallback for titles that bypass the public API.
   `depth_synthesizer.cc` (capsules per bone). The webcam source (pose
   estimation on RGB) and recording playback plug into the same interface.
 
+## Composing with title-specific hooks
+
+A title-specific hook layer (`src/xenia/kernel/title_hooks/*`) may replace
+some NUI functions of one build with its own implementation, for instance
+Project Milo's `NuiImageStreamGetNextFrame` and `NuiSkeletonGetNextFrame`.
+`KernelState::FinishLoadingUserModule` runs `ApplyTitleHooks` first and
+`nui::AttachNuiHle` immediately after, so those entries are already rewritten
+to the `sc 2` trampoline when the generic layer resolves its signatures.
+
+Replacing only *some* functions of the runtime is not safe: the functions of
+the NUI API share state that a foreign implementation cannot see. A title
+that gets our stream handle from `NuiImageStreamOpen` and passes it to
+somebody else's `NuiImageStreamGetNextFrame` gets neither model. Every
+signature entry therefore names an ownership set (`xe::nui::NuiHookSet` in
+`src/xenia/nui/nui_hook_sets.h`), and a set is hooked all-or-nothing:
+
+| set | functions | shared state |
+| --- | --- | --- |
+| `kLifecycle` | `NuiInitialize`, `NuiShutdown` | the device model's initialized flag |
+| `kSkeleton` | `NuiSkeletonTrackingEnable/Disable`, `NuiSkeletonGetNextFrame`, `NuiSkeletonSetTrackedSkeletons`, `NuiTransformSmooth` | tracking flags, frame cursor, smoother |
+| `kImage` | `NuiImageStreamOpen`, `NuiImageStreamGetNextFrame`, `NuiImageStreamReleaseFrame`, `NuiImageStream{Set,Get}ImageFrameFlags`, `NuiSetFrameEndEvent` | stream handles and their guest frame pools |
+| `kCamera` | `NuiCameraElevation{Set,Get}Angle`, `NuiCameraGetNormalToGravity` | the simulated tilt motor |
+| `kTransform` | `NuiImageGetColorPixelCoordinatesFromDepthPixel` | none (pure), but must agree with the image set |
+| `kNone` | tripwire stubs and other standalone entries | none; decided one by one |
+
+`PlanNuiHooks` (pure, unit tested in `src/xenia/nui/testing/nui_hook_set_test.cc`)
+decides per set:
+
+- any function of the set is already hooked by somebody else (its first word
+  is `sc 2`) → **cede** the whole set, hook none of it, log which function is
+  already owned;
+- otherwise a required function of the set is missing (or has no host
+  handler) → **leave the set native**; only that set, the others still get
+  hooked;
+- otherwise **hook** every function of the set.
+
+Only when nothing at all could be replaced and nothing was ceded is the
+sensor reported absent (`SetDevicePresent(false)`); a title whose runtime is
+partly served by title hooks keeps a present sensor.
+
+Pattern-resolved signatures no longer match a function whose entry was
+rewritten, so `nui_hle.cc` also searches for the trampoline followed by the
+rest of the signature (`InstallExternHook` overwrites exactly 16 bytes) to
+tell "already owned" from "not found".
+
+Whoever owns a ceded set reads skeletons or images straight from
+`NuiSystem` without going through our `NuiInitialize` or
+`NuiImageStreamOpen`, so the installer calls
+`NuiSystem::SetExternalConsumers(skeletons, images)` when it cedes the
+skeleton or image set. `BuildDeviceState` then forces `skeleton_tracking`,
+`want_depth`, `want_player_mask` and `want_color` on, so the source
+synthesizes what a foreign handler may read. Nothing changes when no set is
+ceded, and `ResetGuestState` clears the flags when the title is terminated.
+
 ## Conventions
 
 Skeleton space: metres, right-handed, origin at the sensor, +X to the sensor's

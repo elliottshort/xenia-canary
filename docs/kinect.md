@@ -58,7 +58,15 @@ with `NUI HLE:`). Titles with an unknown NUI version see no sensor.
 | `nui_auto_bind_user0` | Bind the first tracked player to the signed-in user 0 |
 | `nui_trace` | Log every call into the emulated NUI runtime |
 | `nui_log_stats` | Log frame statistics every 5 seconds |
-| `nui_hle` | Set to false to leave the title's runtime untouched (debugging) |
+| `nui_hle` | Set to false to leave the title's whole NUI runtime untouched (debugging only) |
+
+`nui_hle` is not the way to make room for a title-specific hook layer: the
+generic layer already cedes a whole group of functions to whoever hooked one
+of them first (see "Composing with title-specific hooks" in
+`docs/nui/architecture.md`), so both can be on at the same time. Turning it
+off removes every generic replacement — camera tilt, image streams, the
+lifecycle — and is only useful when comparing against the title's own
+runtime.
 
 ## Webcam
 
@@ -297,4 +305,7 @@ runtime's public API functions (`NuiInitialize`, `NuiSkeletonGetNextFrame`,
 served by `xe::nui::NuiSystem`, a 30 Hz device model fed by the selected source.
 Functions are located per NUI library version with instruction signatures
 (`src/xenia/kernel/nui/nui_signatures_builtin.cc`); see
-`docs/nui/adding_signatures.md` for adding a version.
+`docs/nui/adding_signatures.md` for adding a version. Signatures are grouped
+into ownership sets that are replaced all-or-nothing, so a title-specific
+hook layer can own part of the runtime (for instance Project Milo's own
+frame functions) while the emulator keeps the rest.

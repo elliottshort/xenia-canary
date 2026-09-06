@@ -69,12 +69,17 @@ In `nui_signatures_builtin.cc` add a `NuiLibrarySignatures` with:
   values seen in the function epilogues);
 - one `NuiFunctionSignature` per function with `mode = "hle"` (emulated),
   `"tripwire"` (log and fail; for features not emulated yet such as speech) or
-  `"native"` (left alone).
+  `"native"` (left alone);
+- the ownership `set` of each function (`HookSet::kLifecycle`, `kSkeleton`,
+  `kImage`, `kCamera`, `kTransform`, or `kNone` for standalone entries such as
+  tripwires). Functions of a set share state and are replaced all-or-nothing;
+  see "Composing with title-specific hooks" in `architecture.md`.
 
 `fixed_address` may be set for a known build; the words are still checked
-before hooking. Every `hle` function must resolve, otherwise the whole version
-is treated as unsupported and the title sees no sensor (a half-replaced runtime
-crashes in ways that are hard to debug).
+before hooking. Every `hle` function of a set must resolve, otherwise that set
+is left native (a half-replaced set crashes in ways that are hard to debug);
+the other sets are still hooked, and the title only sees no sensor when
+nothing at all could be replaced.
 
 ## 5. Verify
 
