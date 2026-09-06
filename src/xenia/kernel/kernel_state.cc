@@ -10,6 +10,7 @@
 #include <ranges>
 
 #include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/nui/nui_hle.h"
 
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/logging.h"
@@ -687,6 +688,7 @@ X_RESULT KernelState::FinishLoadingUserModule(
   emulator_->patcher()->ApplyPatchesForTitle(memory_, module->title_id(),
                                              module->hash());
   emulator_->on_patch_apply();
+  nui::AttachNuiHle(this, module.get());
   if (module->xex_module()) {
     module->xex_module()->Precompile();
   }

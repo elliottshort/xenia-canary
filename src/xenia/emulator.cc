@@ -39,6 +39,9 @@
 #include "xenia/gpu/graphics_system.h"
 #include "xenia/hid/input_driver.h"
 #include "xenia/hid/input_system.h"
+#include "xenia/nui/nui_recorder.h"
+#include "xenia/nui/nui_source.h"
+#include "xenia/nui/nui_system.h"
 #include "xenia/kernel/XLiveAPI.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/title_id_utils.h"
@@ -191,6 +194,12 @@ Emulator::~Emulator() {
     audio_system_->Shutdown();
   }
 
+  // The recorder holds a frame sink on the NUI system; detach it first.
+  xe::nui::NuiRecorder::Get()->Stop();
+  if (nui_system_) {
+    nui_system_->Shutdown();
+  }
+  nui_system_.reset();
   input_system_.reset();
   graphics_system_.reset();
   audio_system_.reset();
@@ -319,6 +328,13 @@ X_STATUS Emulator::Setup(
   // Add inputSystem to UI
   imgui_drawer_->LoadInputSystem(input_system_.get());
 
+  XELOGI("{}: Initializing NUI...", __func__);
+  // The emulated Kinect; its data source and pacer start on demand.
+  xe::nui::SetNuiSourceInputSystem(input_system_.get());
+  nui_system_ = std::make_unique<xe::nui::NuiSystem>(input_system_.get());
+  nui_system_->Setup();
+  xe::nui::NuiRecorder::Get()->Start(nui_system_.get());
+
   XELOGI("{}: Initializing VFS...", __func__);
   // Bring up the virtual filesystem used by the kernel.
   file_system_ = std::make_unique<xe::vfs::VirtualFileSystem>();
@@ -377,6 +393,9 @@ X_STATUS Emulator::TerminateTitle() {
   }
 
   kernel_state_->TerminateTitle();
+  if (nui_system_) {
+    nui_system_->ResetGuestState();
+  }
   title_id_ = std::nullopt;
   title_name_ = "";
   title_version_ = "";
@@ -1207,6 +1226,9 @@ void Emulator::Pause() {
   // Don't hold the lock on this (so any waits follow through)
   graphics_system_->Pause();
   audio_system_->Pause();
+  if (nui_system_) {
+    nui_system_->Pause();
+  }
 
   auto lock = global_critical_region::AcquireDirect();
   auto threads =
@@ -1238,6 +1260,9 @@ void Emulator::Resume() {
 
   graphics_system_->Resume();
   audio_system_->Resume();
+  if (nui_system_) {
+    nui_system_->Resume();
+  }
 
   auto threads =
       kernel_state()->object_table()->GetObjectsByType<kernel::XThread>(

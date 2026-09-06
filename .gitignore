@@ -94,6 +94,7 @@ node_modules/.bin/
 /build/
 /build-arm64/
 /build-x64/
+/build-nui/
 
 # ==============================================================================
 # Local-only paths
@@ -116,3 +117,17 @@ node_modules/.bin/
 /cache0
 /devkit
 recent.toml
+
+# ==============================================================================
+# Local test content and tool output
+# ==============================================================================
+
+# Game dumps used for testing (never redistribute).
+/xbe/
+
+# graphify knowledge-graph output.
+graphify-out/
+
+# Python bytecode from the tools.
+__pycache__/
+*.pyc

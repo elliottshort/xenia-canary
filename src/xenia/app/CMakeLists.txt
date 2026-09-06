@@ -62,6 +62,7 @@ target_link_libraries(xenia-app PRIVATE
   xenia-hid
   xenia-hid-nop
   xenia-kernel
+  xenia-nui
   xenia-patcher
   xenia-ui
   xenia-vfs

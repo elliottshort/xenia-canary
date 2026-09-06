@@ -71,6 +71,12 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
       std::span<const uint8_t> data);
   std::map<uint32_t, std::unique_ptr<ImmediateTexture>> LoadIcons(
       IconsData data);
+  // Creates an immutable R8G8B8A8 texture (|rgba| is width * height * 4
+  // bytes, top-down rows) for ImGui::Image. Returns nullptr when no immediate
+  // drawer is attached.
+  std::unique_ptr<ImmediateTexture> CreateRgbaTexture(
+      uint32_t width, uint32_t height, const uint8_t* rgba,
+      ImmediateTextureFilter filter = ImmediateTextureFilter::kLinear);
 
   ImmediateTexture* GetNotificationIcon(uint8_t user_index) {
     if (user_index >= notification_icon_textures_.size()) {

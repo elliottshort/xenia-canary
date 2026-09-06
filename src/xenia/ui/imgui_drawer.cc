@@ -298,6 +298,15 @@ std::unique_ptr<ImmediateTexture> ImGuiDrawer::LoadImGuiIcon(
   return texture;
 }
 
+std::unique_ptr<ImmediateTexture> ImGuiDrawer::CreateRgbaTexture(
+    uint32_t width, uint32_t height, const uint8_t* rgba,
+    ImmediateTextureFilter filter) {
+  if (!immediate_drawer_ || !rgba || !width || !height) {
+    return {};
+  }
+  return immediate_drawer_->CreateTexture(width, height, filter, false, rgba);
+}
+
 std::map<uint32_t, std::unique_ptr<ImmediateTexture>> ImGuiDrawer::LoadIcons(
     IconsData data) {
   std::map<uint32_t, std::unique_ptr<ImmediateTexture>> icons_;

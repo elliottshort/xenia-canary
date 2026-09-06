@@ -15,6 +15,8 @@
 
 #include "xenia/app/gamerpic_browser.h"
 #include "xenia/app/netplay_settings_dialog.h"
+#include "xenia/app/nui_preview_dialog.h"
+#include "xenia/app/nui_settings_dialog.h"
 #include "xenia/app/profile_dialogs.h"
 #include "xenia/app/updater.h"
 #include "xenia/app/updater_dialog.h"
@@ -117,6 +119,8 @@ class EmulatorWindow {
   void ToggleCompletionDialog();
   void ToggleNetplaySettingsDialog();
   void ToggleNetplayStatusDialog();
+  void ToggleNuiSettingsDialog();
+  void ToggleNuiPreviewDialog();
 
   void SetHotkeysState(bool enabled) { disable_hotkeys_ = !enabled; }
 
@@ -299,6 +303,8 @@ class EmulatorWindow {
   void GpuTraceFrame();
   void GpuClearCaches();
   void ToggleDisplayConfigDialog();
+  void NuiRestartSource();
+  void ShowNuiDirectory();
   void ToggleControllerVibration();
   void ShowCompatibility();
   void ShowFAQ();
@@ -365,6 +371,10 @@ class EmulatorWindow {
   std::unique_ptr<NetplaySettingsDialog> netplay_settings_dialog_;
 
   std::unique_ptr<NetplayStatusDialog> netplay_status_dialog_;
+
+  std::unique_ptr<NuiSettingsDialog> nui_settings_dialog_;
+
+  std::unique_ptr<NuiPreviewDialog> nui_preview_dialog_;
 
   std::vector<RecentTitleEntry> recently_launched_titles_;
 };

@@ -26,6 +26,7 @@
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/debugging.h"
+#include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/platform.h"
 #include "xenia/base/profiling.h"
@@ -957,6 +958,25 @@ bool EmulatorWindow::Initialize() {
         std::bind(&EmulatorWindow::DisplayHotKeysConfig, this)));
   }
   main_menu->AddChild(std::move(hid_menu));
+
+  // NUI (Kinect) menu.
+  auto nui_menu = MenuItem::Create(MenuItem::Type::kPopup, "&NUI");
+  {
+    nui_menu->AddChild(MenuItem::Create(
+        MenuItem::Type::kString, "Kinect &settings...", "",
+        std::bind(&EmulatorWindow::ToggleNuiSettingsDialog, this)));
+    nui_menu->AddChild(MenuItem::Create(
+        MenuItem::Type::kString, "Camera &preview", "",
+        std::bind(&EmulatorWindow::ToggleNuiPreviewDialog, this)));
+    nui_menu->AddChild(MenuItem::Create(MenuItem::Type::kSeparator));
+    nui_menu->AddChild(
+        MenuItem::Create(MenuItem::Type::kString, "&Restart camera/source", "",
+                         std::bind(&EmulatorWindow::NuiRestartSource, this)));
+    nui_menu->AddChild(
+        MenuItem::Create(MenuItem::Type::kString, "Open NUI folder", "",
+                         std::bind(&EmulatorWindow::ShowNuiDirectory, this)));
+  }
+  main_menu->AddChild(std::move(nui_menu));
 
   // XMP menu
   auto xmp_menu = MenuItem::Create(MenuItem::Type::kPopup, "&XMP");
@@ -1995,6 +2015,53 @@ void EmulatorWindow::ToggleNetplayStatusDialog() {
   }
 }
 
+void EmulatorWindow::ToggleNuiSettingsDialog() {
+  if (!nui_settings_dialog_) {
+    nui_settings_dialog_ =
+        std::make_unique<NuiSettingsDialog>(imgui_drawer_.get(), *this);
+  } else {
+    if (nui_settings_dialog_->IsClosing()) {
+      nui_settings_dialog_.release();
+    } else {
+      nui_settings_dialog_.reset();
+    }
+  }
+}
+
+void EmulatorWindow::ToggleNuiPreviewDialog() {
+  if (!nui_preview_dialog_) {
+    nui_preview_dialog_ =
+        std::make_unique<NuiPreviewDialog>(imgui_drawer_.get(), *this);
+  } else {
+    if (nui_preview_dialog_->IsClosing()) {
+      nui_preview_dialog_.release();
+    } else {
+      nui_preview_dialog_.reset();
+    }
+  }
+}
+
+void EmulatorWindow::NuiRestartSource() {
+  auto* nui_system = emulator_->nui_system();
+  if (!nui_system) {
+    return;
+  }
+  nui_system->RestartSource();
+  new xe::ui::HostNotificationWindow(
+      imgui_drawer(), "Kinect",
+      fmt::format("Source '{}' restarted{}", nui_system->source_name(),
+                  nui_system->is_device_present() ? "" : " (no sensor)"),
+      0);
+}
+
+void EmulatorWindow::ShowNuiDirectory() {
+  std::error_code ec;
+  const auto folder = xe::filesystem::GetExecutableFolder() / "nui";
+  LaunchFileExplorer(std::filesystem::is_directory(folder, ec)
+                         ? folder
+                         : xe::filesystem::GetExecutableFolder());
+}
+
 void EmulatorWindow::ToggleControllerVibration() {
   auto input_sys = emulator()->input_system();
   if (input_sys) {
@@ -2765,6 +2832,14 @@ void EmulatorWindow::ClearDialogs() {
 
   if (netplay_status_dialog_) {
     netplay_status_dialog_.reset();
+  }
+
+  if (nui_settings_dialog_) {
+    nui_settings_dialog_.reset();
+  }
+
+  if (nui_preview_dialog_) {
+    nui_preview_dialog_.reset();
   }
 
   imgui_drawer_.get()->ClearDialogs();

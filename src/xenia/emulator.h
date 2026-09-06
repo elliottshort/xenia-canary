@@ -50,6 +50,9 @@ namespace hid {
 class InputDriver;
 class InputSystem;
 }  // namespace hid
+namespace nui {
+class NuiSystem;
+}  // namespace nui
 namespace ui {
 class ImGuiDrawer;
 class Window;
@@ -159,6 +162,9 @@ class Emulator {
 
   // Human-interface Device (HID) adapters for controllers.
   hid::InputSystem* input_system() const { return input_system_.get(); }
+
+  // Emulated Kinect (NUI) sensor.
+  nui::NuiSystem* nui_system() const { return nui_system_.get(); }
 
   // Kernel function export table used to resolve exports when JITing code.
   cpu::ExportResolver* export_resolver() const {
@@ -369,6 +375,7 @@ class Emulator {
   std::unique_ptr<apu::AudioMediaPlayer> audio_media_player_;
   std::unique_ptr<gpu::GraphicsSystem> graphics_system_;
   std::unique_ptr<hid::InputSystem> input_system_;
+  std::unique_ptr<nui::NuiSystem> nui_system_;
 
   std::unique_ptr<cpu::ExportResolver> export_resolver_;
   std::unique_ptr<vfs::VirtualFileSystem> file_system_;
