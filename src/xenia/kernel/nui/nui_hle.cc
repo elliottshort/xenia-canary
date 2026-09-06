@@ -401,7 +401,7 @@ void AttachNuiHle(KernelState* kernel_state, UserModule* module) {
 
   uint32_t hooked = 0;
   for (size_t i = 0; i < candidates.size(); ++i) {
-    if (!plan.hook[i]) {
+    if (!plan.ShouldHook(i)) {
       continue;
     }
     const NuiFunctionSignature* signature = entries[i];

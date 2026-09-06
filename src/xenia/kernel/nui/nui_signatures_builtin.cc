@@ -14,6 +14,11 @@
 // builds (miloReleaseLIB / miloInternalReleaseLIB). Masks zero relative branch
 // displacements and the immediates of lis/addi/lwz pairs that address
 // globals. See docs/nui/adding_signatures.md.
+//
+// The HookSet column is the group of functions the entry shares state with;
+// a group is replaced all-or-nothing, so a title-specific hook layer that
+// owns one function of a group owns the whole group. See nui_hle.cc and
+// docs/nui/architecture.md, "Composing with title-specific hooks".
 
 namespace xe {
 namespace kernel {

@@ -85,6 +85,9 @@ nothing at all could be replaced.
 
 Run with `--nui=true --nui_trace=true --log_level=2` and check:
 
-- `NUI HLE: NUI <version> in <module>: N functions hooked`
+- `NUI HLE: NUI <version> in <module>: N functions hooked in M sets, ...`
+  (any `set ceded to title hooks` line is expected when a title-specific hook
+  layer owns part of the runtime; `set left native` means a signature is
+  wrong or missing)
 - `NuiHLE: first skeleton frame delivered` / `first image frame delivered`
 - no `undefined extern call` lines mentioning `Nui`, `PsCam`, `Detroit`, `Mca`.
