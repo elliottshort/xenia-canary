@@ -208,6 +208,18 @@ class XexModule : public xe::cpu::Module {
   uint32_t GetProcAddress(const std::string_view name) const;
 
   int ApplyPatch(XexModule* module);
+  // Replaces the guest function at |address| with a host handler. The first
+  // four instructions are rewritten to the same "sc 2 / blr" trampoline that
+  // kernel imports use, so |handler| is invoked exactly like an import shim
+  // (arguments in the PPC context, result returned through r3). Must be called
+  // after the image is loaded and before the function has been compiled.
+  // If |expected_words| is not empty, the instructions currently at |address|
+  // must match it, which protects against applying hooks meant for a
+  // different build of the title.
+  bool InstallExternHook(uint32_t address, const std::string_view name,
+                         GuestFunction::ExternHandler handler,
+                         const std::vector<uint32_t>& expected_words = {});
+
   bool Load(const std::string_view name, const std::string_view path,
             const void* xex_addr, size_t xex_length);
   bool LoadContinue();

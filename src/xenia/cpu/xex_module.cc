@@ -1403,6 +1403,61 @@ bool XexModule::ContainsAddress(uint32_t address) {
   return address >= low_address_ && address < high_address_;
 }
 
+bool XexModule::InstallExternHook(uint32_t address, const std::string_view name,
+                                  GuestFunction::ExternHandler handler,
+                                  const std::vector<uint32_t>& expected_words) {
+  if (!loaded_ || !ContainsAddress(address) || (address & 3)) {
+    XELOGE("InstallExternHook({}): {:08X} is not inside module {}", name,
+           address, name_);
+    return false;
+  }
+  uint8_t* p = memory()->TranslateVirtual(address);
+  for (size_t i = 0; i < expected_words.size(); ++i) {
+    uint32_t word = xe::load_and_swap<uint32_t>(p + i * 4);
+    if (word != expected_words[i]) {
+      XELOGE(
+          "InstallExternHook({}): instruction {} at {:08X} is {:08X}, expected "
+          "{:08X}; this build of the title is not the one the hook was made "
+          "for, leaving it alone",
+          name, i, address + i * 4, word, expected_words[i]);
+      return false;
+    }
+  }
+
+  // Same trampoline that SetupLibraryImports emits for kernel imports:
+  //     sc 2
+  //     blr
+  //     nop
+  //     nop
+  auto heap = memory()->LookupHeap(address);
+  uint32_t old_protect = 0;
+  if (heap) {
+    heap->QueryProtect(address, &old_protect);
+    heap->Protect(address, 16, xe::kMemoryProtectRead | xe::kMemoryProtectWrite);
+  }
+  xe::store_and_swap<uint32_t>(p + 0x0, 0x44000042);
+  xe::store_and_swap<uint32_t>(p + 0x4, 0x4E800020);
+  xe::store_and_swap<uint32_t>(p + 0x8, 0x60000000);
+  xe::store_and_swap<uint32_t>(p + 0xC, 0x60000000);
+  if (heap && old_protect) {
+    heap->Protect(address, 16, old_protect);
+  }
+
+  Function* function = nullptr;
+  DeclareFunction(address, &function);
+  if (!function) {
+    XELOGE("InstallExternHook({}): unable to declare function at {:08X}", name,
+           address);
+    return false;
+  }
+  function->set_end_address(address + 16 - 4);
+  function->set_name(name);
+  static_cast<GuestFunction*>(function)->SetupExtern(handler, nullptr);
+  function->set_status(Symbol::Status::kDeclared);
+  XELOGI("InstallExternHook: {} hooked at {:08X}", name, address);
+  return true;
+}
+
 std::unique_ptr<Function> XexModule::CreateFunction(uint32_t address) {
   return std::unique_ptr<Function>(
       processor_->backend()->CreateGuestFunction(this, address));
