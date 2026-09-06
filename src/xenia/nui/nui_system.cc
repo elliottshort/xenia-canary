@@ -102,7 +102,24 @@ void NuiSystem::ResetGuestState() {
   next_tracking_id_ = 1;
   tilt_target_degrees_ = 0.0f;
   tilt_current_degrees_ = 0.0f;
+  external_skeleton_consumers_ = false;
+  external_image_consumers_ = false;
   device_present_ = true;
+}
+
+void NuiSystem::SetExternalConsumers(bool skeletons, bool images) {
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  if (external_skeleton_consumers_ == skeletons &&
+      external_image_consumers_ == images) {
+    return;
+  }
+  external_skeleton_consumers_ = skeletons;
+  external_image_consumers_ = images;
+  XELOGI(
+      "NUI: serving external consumers (skeletons={}, images={}); the source "
+      "produces those planes whether or not the title opened them",
+      skeletons, images);
+  PushDeviceState();
 }
 
 DeviceState NuiSystem::BuildDeviceState() const {
@@ -129,6 +146,19 @@ DeviceState NuiSystem::BuildDeviceState() const {
   // data.
   if (skeleton_enabled_) {
     state.want_player_mask = true;
+  }
+  // Part of the NUI runtime inside the title may be served by a
+  // title-specific hook layer instead of us (see SetExternalConsumers). Those
+  // handlers read this system without ever going through the calls above, so
+  // synthesize what they might read.
+  if (external_skeleton_consumers_) {
+    state.skeleton_tracking = true;
+    state.want_player_mask = true;
+  }
+  if (external_image_consumers_) {
+    state.want_depth = true;
+    state.want_player_mask = true;
+    state.want_color = true;
   }
   state.tilt_degrees =
       cvars::nui_tilt_mode == "ignore" ? 0.0f : tilt_current_degrees_;

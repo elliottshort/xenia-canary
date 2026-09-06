@@ -422,8 +422,14 @@ uint32_t xeMmAllocatePhysicalMemoryEx(uint32_t flags, uint32_t region_size,
 
   // Check protection bits.
   if (!(protect_bits & (X_PAGE_READONLY | X_PAGE_READWRITE))) {
-    XELOGE("MmAllocatePhysicalMemoryEx: bad protection bits");
-    return 0;
+    // Some titles (e.g. Lionhead's Project Milo) only pass the cache policy
+    // (PAGE_WRITECOMBINE/PAGE_NOCACHE). The real kernel still hands out
+    // read/write memory in that case, so do the same instead of failing.
+    XELOGW(
+        "MmAllocatePhysicalMemoryEx: no access bits in protection {:08X} "
+        "(flags {:08X}, size {:08X}), assuming PAGE_READWRITE",
+        protect_bits, flags, region_size);
+    protect_bits |= X_PAGE_READWRITE;
   }
 
   // Either may be OR'ed into protect_bits:

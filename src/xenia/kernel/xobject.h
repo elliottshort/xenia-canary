@@ -125,7 +125,10 @@ class XObject {
     SymbolicLink,
     Thread,
     Timer,
-    Device
+    Device,
+    // An object created by the title through ObCreateObject with its own
+    // X_OBJECT_TYPE. See XGuestObject.
+    GuestObject
   };
 
   static bool HasDispatcherHeader(Type type) {
@@ -278,6 +281,34 @@ class XObject {
   // if we allocated it!
   uint32_t guest_object_ptr_ = 0;
   bool allocated_guest_object_ = false;
+
+  friend class XGuestObject;
+};
+
+// Wraps an object that the title created itself through ObCreateObject with a
+// title-defined X_OBJECT_TYPE (for example the NUI/Kinect runtime library's
+// stream objects, which are allocated with NuiObjectType and then handed to
+// ObOpenObjectByPointer / ObReferenceObjectByHandle).
+//
+// The kernel knows nothing about the layout of such objects, so unlike the
+// other XObject subclasses this wrapper never touches the guest memory of the
+// object itself; only the X_OBJECT_HEADER that precedes it (reference counts)
+// is maintained. One wrapper exists per guest object for as long as at least
+// one handle to it is open.
+class XGuestObject : public XObject {
+ public:
+  static const XObject::Type kObjectType = XObject::Type::GuestObject;
+
+  XGuestObject(KernelState* kernel_state, uint32_t guest_object_ptr,
+               uint32_t guest_type_ptr);
+  ~XGuestObject() override;
+
+  // Guest address of the X_OBJECT_TYPE the object was created with.
+  uint32_t guest_type_ptr() const { return guest_type_ptr_; }
+  X_OBJECT_HEADER* header();
+
+ private:
+  uint32_t guest_type_ptr_;
 };
 
 template <typename T>

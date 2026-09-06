@@ -14,6 +14,8 @@
 #include <string>
 #include <vector>
 
+#include "xenia/nui/nui_hook_sets.h"
+
 namespace xe {
 namespace kernel {
 
@@ -41,12 +43,22 @@ struct NuiHleQuirks {
   uint32_t hr_feature_not_initialized = 0x83010006;
 };
 
+// The ownership groups of xe::nui, spelled without the namespace dance in
+// the signature tables (xe::kernel::nui would otherwise shadow xe::nui).
+using HookSet = xe::nui::NuiHookSet;
+
 // A hookable function of the NUI runtime inside a title.
 struct NuiFunctionSignature {
   const char* name;
   // "hle": replaced by our implementation; "tripwire": replaced by a stub
   // that logs and fails (unsupported feature); "native": left alone.
   const char* mode;
+  // The group of functions this one shares state with. Groups are hooked
+  // all-or-nothing: if a title-specific hook layer already owns one function
+  // of a group, we cede the whole group to it (see nui_hle.cc and
+  // docs/nui/architecture.md, "Composing with title-specific hooks").
+  // HookSet::kNone means the function stands alone.
+  HookSet set;
   // Fixed address for builds we know exactly (0 = search by pattern).
   uint32_t fixed_address;
   // Instruction words from the function entry, in natural (big-endian

@@ -1111,6 +1111,19 @@ dword_result_t XamLookupCommonStringByIndex_entry(dword_t string_index) {
 }
 DECLARE_XAM_EXPORT1(XamLookupCommonStringByIndex, kNone, kImplemented);
 
+// Pops the current system app off the xam app stack (dashboard/guide apps).
+// No system apps are ever loaded on top of the title here.
+dword_result_t XamAppUnloadStack_entry(dword_t unk) { return X_ERROR_SUCCESS; }
+DECLARE_XAM_EXPORT1(XamAppUnloadStack, kNone, kStub);
+
+// Instrumentation/telemetry event logging. Nothing to record.
+dword_result_t XamInstrumentationLogEventEx_entry(dword_t unk1, dword_t unk2,
+                                                  dword_t unk3, dword_t unk4,
+                                                  dword_t unk5) {
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamInstrumentationLogEventEx, kNone, kStub);
+
 }  // namespace xam
 }  // namespace kernel
 }  // namespace xe

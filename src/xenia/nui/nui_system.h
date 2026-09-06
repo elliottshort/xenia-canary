@@ -102,6 +102,14 @@ class NuiSystem {
   // NUI library version, so the title takes its "no sensor" path.
   void SetDevicePresent(bool present) { device_present_ = present; }
 
+  // Declares that code outside the guest-facing NUI layer (a title-specific
+  // hook layer that owns part of the runtime, see kernel/nui/nui_hle.cc)
+  // reads skeletons or images from this system directly, without calling
+  // Initialize / EnableSkeletonTracking / OpenImageStream. The source is
+  // then asked for those planes unconditionally, so a foreign handler never
+  // finds them empty. Cleared by ResetGuestState.
+  void SetExternalConsumers(bool skeletons, bool images);
+
   // Title lifecycle (NuiInitialize / NuiShutdown).
   uint32_t Initialize(uint32_t init_flags);
   void Uninitialize();
@@ -224,6 +232,10 @@ class NuiSystem {
   uint32_t init_flags_ = 0;
   std::atomic<bool> skeleton_enabled_{false};
   uint32_t skeleton_flags_ = 0;
+  // Set by SetExternalConsumers: a foreign owner of part of the NUI runtime
+  // may read skeletons/images without setting the state above.
+  bool external_skeleton_consumers_ = false;
+  bool external_image_consumers_ = false;
   uint32_t title_tracked_ids_[kMaxTrackedSkeletons] = {0, 0};
   std::vector<ImageStream> streams_;
   uint32_t next_stream_id_ = 1;

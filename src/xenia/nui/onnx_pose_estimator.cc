@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <iterator>
 
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/filesystem.h"
@@ -65,6 +66,13 @@ inline float Sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 // NormalizeRadians from detections_to_rects_calculator.cc.
 inline float NormalizeRadians(float angle) {
   return angle - 2.0f * kPi * std::floor((angle + kPi) / (2.0f * kPi));
+}
+
+uint64_t NowUs() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
 }
 
 std::string ToLower(std::string s) {
@@ -435,6 +443,89 @@ void OnnxPoseEstimator::DecodeDetections(const float* boxes,
 // Creation
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Recovery state machine
+// ---------------------------------------------------------------------------
+
+uint64_t InferenceRecovery::BackoffUs(uint32_t attempt) {
+  return kBackoffUs[std::min<uint32_t>(
+      attempt, static_cast<uint32_t>(std::size(kBackoffUs)) - 1)];
+}
+
+void InferenceRecovery::RecordSuccess() { consecutive_failures_ = 0; }
+
+InferenceRecovery::Action InferenceRecovery::RecordFailure(uint64_t now_us,
+                                                           bool device_lost) {
+  if (state_ == State::kFailed) {
+    return Action::kGiveUp;
+  }
+  ++consecutive_failures_;
+  if (state_ == State::kRecovering) {
+    // Already waiting on a rebuild; Poll() decides when it happens.
+    return Action::kWait;
+  }
+  if (state_ == State::kDegradedCpu) {
+    // The CPU provider is the last resort, so a run of failures there ends
+    // the run rather than starting another rebuild.
+    if (consecutive_failures_ < kFailureThreshold) {
+      return Action::kContinue;
+    }
+    state_ = State::kFailed;
+    return Action::kGiveUp;
+  }
+  if (!device_lost && consecutive_failures_ < kFailureThreshold) {
+    return Action::kContinue;
+  }
+  state_ = State::kRecovering;
+  deadline_us_ = now_us + BackoffUs(gpu_attempts_);
+  return Action::kWait;
+}
+
+InferenceRecovery::Action InferenceRecovery::Poll(uint64_t now_us) const {
+  switch (state_) {
+    case State::kHealthy:
+    case State::kDegradedCpu:
+      return Action::kContinue;
+    case State::kFailed:
+      return Action::kGiveUp;
+    case State::kRecovering:
+      break;
+  }
+  if (now_us < deadline_us_) {
+    return Action::kWait;
+  }
+  if (gpu_attempts_ < kMaxGpuAttempts) {
+    return Action::kRebuildGpu;
+  }
+  if (!cpu_attempted_) {
+    return Action::kRebuildCpu;
+  }
+  return Action::kGiveUp;
+}
+
+void InferenceRecovery::RecordRebuildResult(bool success, bool on_cpu,
+                                            uint64_t now_us) {
+  consecutive_failures_ = 0;
+  if (on_cpu) {
+    cpu_attempted_ = true;
+    state_ = success ? State::kDegradedCpu : State::kFailed;
+    return;
+  }
+  ++gpu_attempts_;
+  if (success) {
+    // A later, unrelated device loss gets a full set of attempts again.
+    state_ = State::kHealthy;
+    gpu_attempts_ = 0;
+    deadline_us_ = 0;
+    return;
+  }
+  state_ = State::kRecovering;
+  // With the GPU attempts used up the CPU rebuild happens on the next frame.
+  deadline_us_ = gpu_attempts_ < kMaxGpuAttempts
+                     ? now_us + BackoffUs(gpu_attempts_)
+                     : now_us;
+}
+
 std::unique_ptr<PoseEstimator> PoseEstimator::Create(const Options& options,
                                                      std::string* out_error) {
   return OnnxPoseEstimator::Create(options, out_error);
@@ -453,10 +544,9 @@ OnnxPoseEstimator::~OnnxPoseEstimator() = default;
 
 bool OnnxPoseEstimator::Initialize(const Options& options,
                                    std::string* out_error) {
-  std::string error;
+  options_ = options;
   max_persons_ = std::max<uint32_t>(
       1, std::min<uint32_t>(options.max_persons, kMaxSkeletons));
-  want_segmentation_ = options.want_segmentation;
 
   if (options.model_dir.empty()) {
     if (out_error) {
@@ -464,6 +554,44 @@ bool OnnxPoseEstimator::Initialize(const Options& options,
     }
     return false;
   }
+
+  if (!BuildSessions(options.execution_provider, out_error)) {
+    return false;
+  }
+
+  // Buffers.
+  GenerateAnchors(&anchors_xy_);
+  detector_input_.assign(
+      static_cast<size_t>(kDetectorInputSize) * kDetectorInputSize * 3, 0.0f);
+  landmark_input_.assign(
+      static_cast<size_t>(kLandmarkInputSize) * kLandmarkInputSize * 3, 0.0f);
+  mask_.assign(static_cast<size_t>(kLandmarkInputSize) * kLandmarkInputSize,
+               0.0f);
+  detection_scratch_.reserve(256);
+  detections_.reserve(16);
+  regions_.reserve(max_persons_);
+  frame_index_ = 0;
+
+  XELOGI(
+      "NUI pose: ONNX Runtime {} ({}), detector pose_detection.onnx, "
+      "landmarks {} ({} persons, segmentation {})",
+      runtime_->version(), landmark_->provider_name(), landmark_model_name_,
+      max_persons_, want_segmentation_ ? "on" : "off");
+  return true;
+}
+
+void OnnxPoseEstimator::DestroySessions() {
+  detector_.reset();
+  landmark_.reset();
+  regions_.clear();
+}
+
+bool OnnxPoseEstimator::BuildSessions(const std::string& provider,
+                                      std::string* out_error) {
+  DestroySessions();
+  std::string error;
+  const Options& options = options_;
+  want_segmentation_ = options.want_segmentation;
 
   // The runtime search order is nui_runtime_path, <storage>/nui/runtime,
   // then the executable folder. Options carries only the model folder, so
@@ -483,7 +611,7 @@ bool OnnxPoseEstimator::Initialize(const Options& options,
   }
 
   OnnxSession::Options session_options;
-  session_options.execution_provider = options.execution_provider;
+  session_options.execution_provider = provider;
   session_options.intra_op_threads = options.threads;
 
   // Detector.
@@ -508,6 +636,7 @@ bool OnnxPoseEstimator::Initialize(const Options& options,
     return false;
   }
   if (!BindDetectorTensors(out_error)) {
+    DestroySessions();
     return false;
   }
 
@@ -548,7 +677,12 @@ bool OnnxPoseEstimator::Initialize(const Options& options,
       XELOGW("NUI pose: {} failed to load: {}", file, error);
       continue;
     }
-    landmark_model_name_ = "pose_landmark_" + variant;
+    {
+      // Published to the accessors, which any thread may call.
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      landmark_model_name_ = "pose_landmark_" + variant;
+      backend_name_ = landmark_->provider_name();
+    }
     if (variant != quality) {
       XELOGW("NUI pose: using {} instead of pose_landmark_{}",
              landmark_model_name_, quality);
@@ -556,7 +690,7 @@ bool OnnxPoseEstimator::Initialize(const Options& options,
     break;
   }
   if (!landmark_) {
-    detector_.reset();
+    DestroySessions();
     if (out_error) {
       *out_error = fmt::format(
           "no landmark model could be loaded from {} (tried {}); run "
@@ -566,29 +700,9 @@ bool OnnxPoseEstimator::Initialize(const Options& options,
     return false;
   }
   if (!BindLandmarkTensors(out_error)) {
-    detector_.reset();
-    landmark_.reset();
+    DestroySessions();
     return false;
   }
-
-  // Buffers.
-  GenerateAnchors(&anchors_xy_);
-  detector_input_.assign(
-      static_cast<size_t>(kDetectorInputSize) * kDetectorInputSize * 3, 0.0f);
-  landmark_input_.assign(
-      static_cast<size_t>(kLandmarkInputSize) * kLandmarkInputSize * 3, 0.0f);
-  mask_.assign(static_cast<size_t>(kLandmarkInputSize) * kLandmarkInputSize,
-               0.0f);
-  detection_scratch_.reserve(256);
-  detections_.reserve(16);
-  regions_.reserve(max_persons_);
-  frame_index_ = 0;
-
-  XELOGI(
-      "NUI pose: ONNX Runtime {} ({}), detector pose_detection.onnx, "
-      "landmarks {} ({} persons, segmentation {})",
-      runtime_->version(), landmark_->provider_name(), landmark_model_name_,
-      max_persons_, want_segmentation_ ? "on" : "off");
   return true;
 }
 
@@ -717,6 +831,12 @@ bool OnnxPoseEstimator::Process(const uint8_t* rgba, uint32_t width,
     }
     return false;
   }
+  // A lost GPU device makes every later Run() fail the same way, so the
+  // sessions are rebuilt here (never per frame: MaybeRecover honours the
+  // backoff and returns immediately while one is pending).
+  if (!MaybeRecover(out_error)) {
+    return false;
+  }
   if (!detector_ || !landmark_) {
     if (out_error) {
       *out_error = "estimator is not initialized";
@@ -733,9 +853,11 @@ bool OnnxPoseEstimator::Process(const uint8_t* rgba, uint32_t width,
   const bool run_detector =
       regions_.empty() ||
       (regions_.size() < max_persons_ && frame_index_ % kDetectorInterval == 0);
+  std::string run_error;
   if (run_detector) {
-    if (!RunDetector(rgba, width, height, stride, out_error)) {
+    if (!RunDetector(rgba, width, height, stride, &run_error)) {
       regions_.clear();
+      NoteInferenceFailure(run_error, out_error);
       return false;
     }
     const float w = static_cast<float>(width);
@@ -779,9 +901,10 @@ bool OnnxPoseEstimator::Process(const uint8_t* rgba, uint32_t width,
     PoseResult& result = (*out_results)[kept];
     PoseRegion next_region;
     if (!RunLandmarks(rgba, width, height, stride, regions_[i], &result,
-                      &next_region, out_error)) {
+                      &next_region, &run_error)) {
       regions_.clear();
       out_results->clear();
+      NoteInferenceFailure(run_error, out_error);
       return false;
     }
     if (result.pose_score < kMinPoseScore ||
@@ -800,7 +923,130 @@ bool OnnxPoseEstimator::Process(const uint8_t* rgba, uint32_t width,
   const auto t1 = std::chrono::steady_clock::now();
   last_inference_ms_ =
       std::chrono::duration<double, std::milli>(t1 - t0).count();
+  recovery_.RecordSuccess();
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// Recovery (inference thread)
+// ---------------------------------------------------------------------------
+
+bool OnnxPoseEstimator::MaybeRecover(std::string* out_error) {
+  const InferenceRecovery::State state = recovery_.state();
+  if (state == InferenceRecovery::State::kHealthy ||
+      state == InferenceRecovery::State::kDegradedCpu) {
+    return true;  // sessions are alive
+  }
+  const uint64_t now_us = NowUs();
+  std::string error;
+  switch (recovery_.Poll(now_us)) {
+    case InferenceRecovery::Action::kContinue:
+      return true;
+    case InferenceRecovery::Action::kWait: {
+      const uint64_t deadline_us = recovery_.retry_deadline_us();
+      const double wait_s =
+          deadline_us > now_us ? (deadline_us - now_us) / 1000000.0 : 0.0;
+      if (out_error) {
+        *out_error = fmt::format(
+            "the inference device was lost; rebuilding in {:.1f} s", wait_s);
+      }
+      return false;
+    }
+    case InferenceRecovery::Action::kRebuildGpu: {
+      const uint32_t attempt = recovery_.gpu_attempts() + 1;
+      XELOGW("NUI pose: rebuilding the inference sessions (attempt {} of {})",
+             attempt, InferenceRecovery::kMaxGpuAttempts);
+      const bool ok = BuildSessions(options_.execution_provider, &error);
+      recovery_.RecordRebuildResult(ok, /*on_cpu=*/false, NowUs());
+      if (ok) {
+        XELOGI("NUI pose: inference recovered on {} with {}", backend_name(),
+               model_name());
+        PublishHealth(BackendHealth::kOk);
+        return true;
+      }
+      DestroySessions();
+      if (out_error) {
+        *out_error = fmt::format(
+            "the inference device was lost; rebuild failed: {}", error);
+      }
+      return false;
+    }
+    case InferenceRecovery::Action::kRebuildCpu: {
+      const bool ok = BuildSessions("cpu", &error);
+      recovery_.RecordRebuildResult(ok, /*on_cpu=*/true, NowUs());
+      if (ok) {
+        XELOGW(
+            "NUI pose: the GPU did not come back after {} attempts; pose "
+            "estimation now runs on the CPU with {}",
+            InferenceRecovery::kMaxGpuAttempts, model_name());
+        PublishHealth(BackendHealth::kDegradedCpu);
+        return true;
+      }
+      DestroySessions();
+      XELOGE(
+          "NUI pose: the CPU fallback failed too ({}); giving up on pose "
+          "estimation for the rest of this run",
+          error);
+      PublishHealth(BackendHealth::kFailed);
+      if (out_error) {
+        *out_error = "pose estimation is unavailable after a lost device";
+      }
+      return false;
+    }
+    case InferenceRecovery::Action::kGiveUp:
+      break;
+  }
+  if (out_error) {
+    *out_error = "pose estimation is unavailable after a lost device";
+  }
+  return false;
+}
+
+void OnnxPoseEstimator::NoteInferenceFailure(const std::string& error,
+                                             std::string* out_error) {
+  if (out_error) {
+    *out_error = error;
+  }
+  const bool device_lost = (detector_ && detector_->device_lost()) ||
+                           (landmark_ && landmark_->device_lost()) ||
+                           OnnxErrorIsDeviceLost(error);
+  const uint64_t now_us = NowUs();
+  const InferenceRecovery::Action action =
+      recovery_.RecordFailure(now_us, device_lost);
+  const BackendHealth health = health_.load(std::memory_order_relaxed);
+  if (action == InferenceRecovery::Action::kWait &&
+      health != BackendHealth::kRecovering) {
+    // One line per state change; the per-frame failures are the caller's to
+    // throttle.
+    const uint64_t deadline_us = recovery_.retry_deadline_us();
+    const double wait_s =
+        deadline_us > now_us ? (deadline_us - now_us) / 1000000.0 : 0.0;
+    if (device_lost) {
+      XELOGE(
+          "NUI pose: the inference device was lost ({}); dropping the {} "
+          "sessions and rebuilding in {:.0f} s",
+          error, backend_name(), wait_s);
+    } else {
+      XELOGE(
+          "NUI pose: {} inference failures in a row (last: {}); rebuilding "
+          "the sessions in {:.0f} s",
+          recovery_.consecutive_failures(), error, wait_s);
+    }
+    DestroySessions();
+    PublishHealth(BackendHealth::kRecovering);
+  } else if (action == InferenceRecovery::Action::kGiveUp &&
+             health != BackendHealth::kFailed) {
+    XELOGE(
+        "NUI pose: inference keeps failing on the CPU ({}); giving up on pose "
+        "estimation for the rest of this run",
+        error);
+    DestroySessions();
+    PublishHealth(BackendHealth::kFailed);
+  }
+}
+
+void OnnxPoseEstimator::PublishHealth(BackendHealth health) {
+  health_.store(health, std::memory_order_relaxed);
 }
 
 // Detector pre-processing is ImageToTensorCalculator (224x224,
@@ -1079,11 +1325,34 @@ void OnnxPoseEstimator::ResampleSegmentation(const PoseRegion& region,
   }
 }
 
+PoseEstimator::BackendHealth OnnxPoseEstimator::backend_health() const {
+  return health_.load(std::memory_order_relaxed);
+}
+
+std::string OnnxPoseEstimator::status() const {
+  switch (health_.load(std::memory_order_relaxed)) {
+    case BackendHealth::kRecovering:
+      return "pose estimation lost the GPU, retrying";
+    case BackendHealth::kDegradedCpu:
+      return "pose estimation on CPU after a GPU reset";
+    case BackendHealth::kFailed:
+      return "pose estimation stopped after a GPU reset";
+    case BackendHealth::kOk:
+      break;
+  }
+  return std::string();
+}
+
+// The provider of the last session that loaded, so it still names the
+// backend while the sessions are being rebuilt (and names the CPU after a
+// fallback).
 std::string OnnxPoseEstimator::backend_name() const {
-  return landmark_ ? landmark_->provider_name() : std::string();
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  return backend_name_;
 }
 
 std::string OnnxPoseEstimator::model_name() const {
+  std::lock_guard<std::mutex> lock(state_mutex_);
   return landmark_model_name_;
 }
 

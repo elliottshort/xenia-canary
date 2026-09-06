@@ -15,6 +15,7 @@
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "xenia/base/byte_order.h"
 #include "xenia/base/filesystem.h"
@@ -28,6 +29,7 @@
 #include "xenia/kernel/util/xex2_info.h"
 #include "xenia/memory.h"
 #include "xenia/nui/nui_flags.h"
+#include "xenia/nui/nui_hook_sets.h"
 #include "xenia/nui/nui_system.h"
 
 namespace xe {
@@ -137,6 +139,30 @@ uint32_t FindByPattern(Memory* memory, cpu::XexModule* xex,
   return *out_match_count == 1 ? found : 0;
 }
 
+// Searches for a function whose entry a title-specific hook layer already
+// rewrote to the syscall trampoline before we ran: the first four words are
+// the trampoline (InstallExternHook overwrites exactly 16 bytes) and the rest
+// of the signature is still intact, so the plain pattern no longer matches.
+// Returns 0 when not found or ambiguous.
+uint32_t FindHookedByPattern(Memory* memory, cpu::XexModule* xex,
+                             const NuiFunctionSignature& signature) {
+  // sc 2; blr; nop; nop
+  static constexpr uint32_t kTrampolineWords[4] = {
+      kSyscallTrampolineWord, 0x4E800020, 0x60000000, 0x60000000};
+  if (signature.words.size() <= 4) {
+    // Nothing left of the signature to identify the function by.
+    return 0;
+  }
+  NuiFunctionSignature hooked = signature;
+  for (size_t i = 0; i < 4; ++i) {
+    hooked.words[i] = kTrampolineWords[i];
+    if (i < hooked.masks.size()) {
+      hooked.masks[i] = 0xFFFFFFFFu;
+    }
+  }
+  uint32_t match_count = 0;
+  return FindByPattern(memory, xex, hooked, &match_count);
+}
 
 // Writes the module image and a sidecar describing it, for offline analysis
 // (Ghidra) when adding signatures for a NUI library version.
@@ -266,60 +292,106 @@ void AttachNuiHle(KernelState* kernel_state, UserModule* module) {
     return;
   }
 
-  // Resolve every function first; an incompletely replaced runtime is worse
-  // than none.
-  struct Resolved {
-    const NuiFunctionSignature* signature;
-    uint32_t address;
-    bool already_hooked;
-  };
-  std::vector<Resolved> resolved;
-  std::vector<std::string> missing;
+  // Resolve every function first, then decide per ownership set (see
+  // xe::nui::NuiHookSet): the functions of a set share state, so a set that
+  // is partly ours and partly somebody else's is worse than one we leave
+  // alone entirely.
+  std::vector<const NuiFunctionSignature*> entries;
+  std::vector<xe::nui::NuiHookCandidate> candidates;
   for (const auto& signature : signatures->functions) {
     const std::string mode = signature.mode ? signature.mode : "hle";
     if (mode == "native") {
       continue;
     }
-    uint32_t address = 0;
-    bool already_hooked = false;
+    xe::nui::NuiHookCandidate candidate;
+    candidate.name = signature.name;
+    candidate.set = signature.set;
+    candidate.required = mode == "hle";
     if (signature.fixed_address) {
       if (xex->ContainsAddress(signature.fixed_address)) {
         const uint32_t first = xe::load_and_swap<uint32_t>(
             memory->TranslateVirtual(signature.fixed_address));
         if (first == kSyscallTrampolineWord) {
-          address = signature.fixed_address;
-          already_hooked = true;
+          candidate.address = signature.fixed_address;
+          candidate.resolved = true;
+          candidate.already_hooked = true;
         } else if (MatchAt(memory, signature.fixed_address, signature)) {
-          address = signature.fixed_address;
+          candidate.address = signature.fixed_address;
+          candidate.resolved = true;
         }
       }
     } else {
       uint32_t match_count = 0;
-      address = FindByPattern(memory, xex, signature, &match_count);
+      const uint32_t address =
+          FindByPattern(memory, xex, signature, &match_count);
       if (match_count > 1) {
         XELOGW("NUI HLE: signature for {} matched {} times, not hooking",
                signature.name, match_count);
-      }
-    }
-    if (!address) {
-      if (mode == "hle") {
-        missing.push_back(signature.name);
+      } else if (address) {
+        candidate.address = address;
+        candidate.resolved = true;
       } else {
-        XELOGD("NUI HLE: optional {} not found", signature.name);
+        // A title-specific hook layer that ran before us (ApplyTitleHooks)
+        // rewrites the entry, which breaks the pattern; look for the
+        // trampoline followed by the rest of the signature.
+        const uint32_t hooked_address =
+            FindHookedByPattern(memory, xex, signature);
+        if (hooked_address) {
+          candidate.address = hooked_address;
+          candidate.resolved = true;
+          candidate.already_hooked = true;
+        }
       }
-      continue;
     }
-    resolved.push_back({&signature, address, already_hooked});
+    if (!candidate.resolved && !candidate.required) {
+      XELOGD("NUI HLE: optional {} not found", signature.name);
+    }
+    // A function we have no host implementation for cannot be served, so it
+    // counts as unresolved and its set stays native.
+    if (candidate.resolved && !candidate.already_hooked &&
+        !(candidate.required ? LookupNuiHleHandler(signature.name)
+                             : LookupNuiTripwireHandler(signature.name))) {
+      XELOGW("NUI HLE: no host implementation for {}, leaving it native",
+             signature.name);
+      candidate.resolved = false;
+    }
+    entries.push_back(&signature);
+    candidates.push_back(std::move(candidate));
   }
-  if (!missing.empty()) {
-    std::string names;
-    for (const auto& name : missing) {
-      names += " " + name;
+
+  const xe::nui::NuiHookPlan plan = xe::nui::PlanNuiHooks(candidates);
+  uint32_t hooked_sets = 0;
+  for (const auto& decision : plan.decisions) {
+    switch (decision.status) {
+      case xe::nui::NuiHookSetStatus::kHook:
+        ++hooked_sets;
+        break;
+      case xe::nui::NuiHookSetStatus::kCeded:
+        if (decision.set == xe::nui::NuiHookSet::kNone) {
+          XELOGI("NUI HLE: {} ceded to title hooks (already hooked at {:08X})",
+                 decision.label, decision.blocking_address);
+        } else {
+          XELOGI(
+              "NUI HLE: {} set ceded to title hooks ({} at {:08X} is already "
+              "hooked)",
+              decision.label, decision.blocking_function,
+              decision.blocking_address);
+        }
+        break;
+      case xe::nui::NuiHookSetStatus::kMissing:
+        XELOGW(
+            "NUI HLE: {} set left native: {} was not found in {}; the title "
+            "keeps its own implementation of that set",
+            decision.label, decision.blocking_function, module->name());
+        break;
     }
+  }
+
+  if (!plan.required_hooked_count && !plan.ceded_set_count) {
     XELOGW(
-        "NUI HLE: NUI {} in {} is known but these functions were not found:{}; "
-        "the title will see no Kinect",
-        nui_version, module->name(), names);
+        "NUI HLE: NUI {} in {} is known but none of its functions could be "
+        "replaced; the title will see no Kinect",
+        nui_version, module->name());
     nui_system->SetDevicePresent(false);
     return;
   }
@@ -328,32 +400,35 @@ void AttachNuiHle(KernelState* kernel_state, UserModule* module) {
   g_active_quirks = signatures->quirks;
 
   uint32_t hooked = 0;
-  uint32_t skipped = 0;
-  for (const auto& entry : resolved) {
-    const std::string mode = entry.signature->mode ? entry.signature->mode
-                                                   : "hle";
-    if (entry.already_hooked) {
-      XELOGI("NUI HLE: {} at {:08X} is already hooked (title hooks), skipping",
-             entry.signature->name, entry.address);
-      ++skipped;
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    if (!plan.hook[i]) {
       continue;
     }
+    const NuiFunctionSignature* signature = entries[i];
+    const std::string mode = signature->mode ? signature->mode : "hle";
     cpu::GuestFunction::ExternHandler handler =
-        mode == "tripwire" ? LookupNuiTripwireHandler(entry.signature->name)
-                           : LookupNuiHleHandler(entry.signature->name);
-    if (!handler) {
-      XELOGW("NUI HLE: no host implementation for {}, leaving it native",
-             entry.signature->name);
-      continue;
-    }
-    const std::string hook_name =
-        std::string("NuiHLE::") + entry.signature->name;
-    if (xex->InstallExternHook(entry.address, hook_name, handler, {})) {
+        mode == "tripwire" ? LookupNuiTripwireHandler(signature->name)
+                           : LookupNuiHleHandler(signature->name);
+    const std::string hook_name = std::string("NuiHLE::") + signature->name;
+    if (xex->InstallExternHook(candidates[i].address, hook_name, handler, {})) {
       ++hooked;
     }
   }
-  XELOGI("NUI HLE: NUI {} in {}: {} functions hooked, {} left to title hooks",
-         nui_version, module->name(), hooked, skipped);
+
+  // Whoever owns a ceded set reads skeletons or images straight from the
+  // device model without going through our NuiInitialize or
+  // NuiImageStreamOpen, so the source has to produce those planes anyway.
+  const bool skeleton_ceded = plan.IsSetCeded(xe::nui::NuiHookSet::kSkeleton);
+  const bool image_ceded = plan.IsSetCeded(xe::nui::NuiHookSet::kImage);
+  if (skeleton_ceded || image_ceded) {
+    nui_system->SetExternalConsumers(skeleton_ceded, image_ceded);
+  }
+
+  XELOGI(
+      "NUI HLE: NUI {} in {}: {} functions hooked in {} sets, {} sets ceded "
+      "to title hooks, {} sets left native",
+      nui_version, module->name(), hooked, hooked_sets, plan.ceded_set_count,
+      plan.missing_set_count);
   nui_system->SetDevicePresent(true);
 }
 

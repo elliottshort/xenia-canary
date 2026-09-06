@@ -16,12 +16,14 @@
 #include "xenia/base/logging.h"
 #include "xenia/emulator.h"
 #include "xenia/hid/input_system.h"
+#include "xenia/kernel/title_hooks.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_memory.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_module.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_ob.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_threading.h"
+#include "xenia/kernel/xbdm/xbdm_module.h"
 #include "xenia/kernel/xevent.h"
 #include "xenia/kernel/xmodule.h"
 #include "xenia/kernel/xnotifylistener.h"
@@ -393,6 +395,20 @@ bool KernelState::IsModuleLoaded(const std::string_view name) {
   return false;
 }
 
+bool KernelState::EnsureKernelModuleLoaded(const std::string_view name) {
+  if (IsKernelModule(name)) {
+    return true;
+  }
+  auto base_name = xe::utf8::find_base_name_from_guest_path(name);
+  if (xe::utf8::equal_case(base_name, "xbdm") ||
+      xe::utf8::equal_case(base_name, "xbdm.xex")) {
+    XELOGI("Title imports xbdm.xex; loading the HLE xbdm module on demand");
+    LoadKernelModule<xbdm::XbdmModule>();
+    return true;
+  }
+  return false;
+}
+
 object_ref<KernelModule> KernelState::GetKernelModule(
     const std::string_view name) {
   assert_true(IsKernelModule(name));
@@ -688,6 +704,7 @@ X_RESULT KernelState::FinishLoadingUserModule(
   emulator_->patcher()->ApplyPatchesForTitle(memory_, module->title_id(),
                                              module->hash());
   emulator_->on_patch_apply();
+  ApplyTitleHooks(this, module.get());
   nui::AttachNuiHle(this, module.get());
   if (module->xex_module()) {
     module->xex_module()->Precompile();

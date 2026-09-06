@@ -3581,6 +3581,11 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
   ID3D12Device* device = GetD3D12Provider().GetDevice();
   HRESULT device_removed_reason = device->GetDeviceRemovedReason();
   if (FAILED(device_removed_reason)) {
+    XELOGE(
+        "D3D12 device removed, reason {:08X} (887A0005 removed, 887A0006 hung "
+        "(TDR), 887A0007 reset, 887A0020 driver internal error, 887A0001 "
+        "invalid call); frame {}",
+        static_cast<uint32_t>(device_removed_reason), frame_current_);
     device_removed_ = true;
     graphics_system_->OnHostGpuLossFromAnyThread(device_removed_reason !=
                                                  DXGI_ERROR_DEVICE_REMOVED);

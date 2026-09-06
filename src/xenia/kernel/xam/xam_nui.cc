@@ -79,6 +79,30 @@ dword_result_t XamUserNuiGetUserIndex_entry(unknown_t unk, lpdword_t index) {
 }
 DECLARE_XAM_EXPORT1(XamUserNuiGetUserIndex, kNone, kStub);
 
+// Kinect identity: titles bind a recognised (enrolled) body to a signed-in
+// user index. Without a sensor nobody is ever enrolled.
+dword_result_t XamUserNuiGetEnrollmentIndex_entry(dword_t user_index,
+                                                  lpdword_t enrollment_index) {
+  if (enrollment_index) {
+    *enrollment_index = 0xFFFFFFFF;
+  }
+  return X_E_NO_SUCH_USER;
+}
+DECLARE_XAM_EXPORT1(XamUserNuiGetEnrollmentIndex, kNone, kStub);
+
+dword_result_t XamUserNuiBind_entry(dword_t user_index,
+                                    dword_t enrollment_index) {
+  return X_E_NO_SUCH_USER;
+}
+DECLARE_XAM_EXPORT1(XamUserNuiBind, kNone, kStub);
+
+dword_result_t XamUserNuiUnbind_entry(dword_t user_index) {
+  // Called for every descriptor slot during runtime start-up; nothing is
+  // bound so there is nothing to undo.
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamUserNuiUnbind, kNone, kStub);
+
 dword_result_t XamUserNuiGetUserIndexForSignin_entry(lpdword_t index) {
   for (uint32_t i = 0; i < XUserMaxUserCount; i++) {
     auto profile = kernel_state()->xam_state()->GetUserProfile(i);

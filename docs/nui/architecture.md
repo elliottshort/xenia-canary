@@ -33,8 +33,9 @@ fallback for titles that bypass the public API.
   selects a signature set for the NUI version, resolves every function
   (fixed address or masked pattern search over code pages) and installs the
   hooks with `XexModule::InstallExternHook` (`sc 2; blr` at the entry, host
-  handler via `GuestFunction::SetupExtern`). Addresses already rewritten to
-  `sc 2` by title-specific hooks are skipped.
+  handler via `GuestFunction::SetupExtern`). Functions another hook layer
+  already owns are left alone, together with the rest of their ownership set
+  (see below).
 - `nui_hle_handlers.cc`: the handlers. Skeleton frames are converted to the
   big-endian `NUI_SKELETON_FRAME`; image streams get guest memory allocated
   once per (type, resolution, frame limit): frame descriptors, D3D texture

@@ -170,6 +170,14 @@ dword_result_t DmMapDevkitDrive_entry(const ppc_context_t& ctx) {
 
   fs->RegisterSymbolicLink("DEVKIT:", "\\DEVKIT");
   fs->RegisterSymbolicLink("e:", "\\DEVKIT");
+
+  // See the matching mount in xenia_main.cc: E: is also reachable as the
+  // DEVKIT folder of the HDD's first partition.
+  auto devkit_partition_device = std::make_unique<xe::vfs::HostPathDevice>(
+      "\\Device\\Harddisk0\\Partition1\\DEVKIT", "devkit", false);
+  if (devkit_partition_device->Initialize()) {
+    fs->RegisterDevice(std::move(devkit_partition_device));
+  }
   return 0;
 }
 DECLARE_XBDM_EXPORT1(DmMapDevkitDrive, kDebug, kImplemented);
@@ -566,6 +574,92 @@ DECLARE_XBDM_EXPORT1(__CAP_Enter_Function, kDebug, kStub);
 void __CAP_Exit_Function_entry() {}
 
 DECLARE_XBDM_EXPORT1(__CAP_Exit_Function, kDebug, kStub);
+
+// Devkit-only APIs used by internal/development builds (e.g. Lionhead's
+// "Project Milo" toolbox). None of these have a meaningful host equivalent, so
+// they report "not available" in the way the XDK documents so titles skip the
+// corresponding feature instead of stalling.
+
+// HRESULT DmGetMouseChanges(PBYTE buttons, PSHORT dx, PSHORT dy, PSHORT wheel)
+// Polled every frame by titles with XDK mouse support. Any failure HRESULT
+// means "no mouse data", which is what a retail console reports.
+dword_result_t DmGetMouseChanges_entry(lpvoid_t buttons_ptr, lpvoid_t dx_ptr,
+                                       lpvoid_t dy_ptr, lpvoid_t wheel_ptr) {
+  return XBDM_UNSUCCESSFUL;
+}
+DECLARE_XBDM_EXPORT2(DmGetMouseChanges, kDebug, kStub, kHighFrequency);
+
+// HRESULT DmWalkModuleSections(PDM_WALK_MODSECT* walk, LPCSTR module,
+//                              PDMN_SECTIONLOAD section)
+// We do not expose per-section information; report an empty list.
+dword_result_t DmWalkModuleSections_entry(lpdword_t walk_ptr,
+                                          lpstring_t module_name_ptr,
+                                          lpvoid_t section_ptr) {
+  if (!walk_ptr || !section_ptr) {
+    return X_E_INVALIDARG;
+  }
+  *walk_ptr = 0;
+  return XBDM_ENDOFLIST;
+}
+DECLARE_XBDM_EXPORT1(DmWalkModuleSections, kDebug, kStub);
+
+// HRESULT DmCloseModuleSections(PDM_WALK_MODSECT walk)
+dword_result_t DmCloseModuleSections__entry(lpdword_t walk_ptr) {
+  return XBDM_SUCCESSFUL;
+}
+DECLARE_XBDM_EXPORT1(DmCloseModuleSections_, kDebug, kStub);
+
+// HRESULT DmGetDebugMemorySize(PDWORD size)
+// Development kits may expose extra memory to the title; we behave like a
+// console without it.
+dword_result_t DmGetDebugMemorySize_entry(lpdword_t size_ptr) {
+  if (!size_ptr) {
+    return X_E_INVALIDARG;
+  }
+  *size_ptr = 0;
+  return XBDM_SUCCESSFUL;
+}
+DECLARE_XBDM_EXPORT1(DmGetDebugMemorySize, kDebug, kStub);
+
+// HRESULT DmGetAdditionalTitleMemorySetting(PDWORD setting)
+dword_result_t DmGetAdditionalTitleMemorySetting_entry(lpdword_t setting_ptr) {
+  if (!setting_ptr) {
+    return X_E_INVALIDARG;
+  }
+  *setting_ptr = 0;
+  return XBDM_SUCCESSFUL;
+}
+DECLARE_XBDM_EXPORT1(DmGetAdditionalTitleMemorySetting, kDebug, kStub);
+
+// HRESULT DmQueryMemoryStatistics(PDM_MEMORY_STATISTICS stats)
+// Same structure as the title variant; report the title view of memory.
+dword_result_t DmQueryMemoryStatistics_entry(
+    pointer_t<X_DM_QUERY_MEMORY_STATISTICS_RESULT> stats_ptr) {
+  if (!stats_ptr) {
+    return X_E_INVALIDARG;
+  }
+  return DmQueryTitleMemoryStatistics_entry(stats_ptr);
+}
+DECLARE_XBDM_EXPORT1(DmQueryMemoryStatistics, kDebug, kStub);
+
+// HRESULT DmTraceStartRecording(LPCSTR file_name, DWORD flags)
+// XTrace recording requires the debug monitor's trace buffer; unavailable.
+dword_result_t DmTraceStartRecording_entry(lpstring_t file_name_ptr,
+                                           dword_t flags) {
+  return XBDM_UNSUCCESSFUL;
+}
+DECLARE_XBDM_EXPORT1(DmTraceStartRecording, kDebug, kStub);
+
+// HRESULT DmTraceStopRecording(void)
+dword_result_t DmTraceStopRecording_entry() { return XBDM_UNSUCCESSFUL; }
+DECLARE_XBDM_EXPORT1(DmTraceStopRecording, kDebug, kStub);
+
+// HRESULT DmCrashDump(BOOL with_full_memory)
+dword_result_t DmCrashDump_entry(dword_t with_full_memory) {
+  XELOGW("DmCrashDump requested by title (ignored)");
+  return XBDM_SUCCESSFUL;
+}
+DECLARE_XBDM_EXPORT1(DmCrashDump, kDebug, kStub);
 
 }  // namespace xbdm
 }  // namespace kernel

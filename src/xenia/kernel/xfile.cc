@@ -227,13 +227,15 @@ X_STATUS XFile::ReadScatter(uint32_t segments_guest_address, uint32_t length,
     }
 
     uint32_t bytes_read = 0;
-    result =
-        ReadInternal(read_buffer, read_length,
-                     byte_offset ? ((byte_offset != -1 && byte_offset != -2)
-                                        ? byte_offset + read_total
-                                        : byte_offset)
-                                 : -1,
-                     &bytes_read, apc_context, false);
+    // An explicit offset of 0 is a valid position (the start of the file);
+    // only the -1 "no ByteOffset given" and -2 FILE_USE_FILE_POINTER_POSITION
+    // sentinels mean "continue from the current position".
+    uint64_t page_offset =
+        (byte_offset == uint64_t(-1) || byte_offset == uint64_t(-2))
+            ? uint64_t(-1)
+            : byte_offset + read_total;
+    result = ReadInternal(read_buffer, read_length, page_offset, &bytes_read,
+                          apc_context, false);
 
     if (result != X_STATUS_SUCCESS) {
       break;

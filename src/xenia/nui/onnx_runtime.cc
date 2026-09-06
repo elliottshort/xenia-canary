@@ -178,6 +178,64 @@ bool PathStartsWith(const std::filesystem::path& path,
 
 const std::string& OnnxRuntime::load_error() { return g_load_error; }
 
+bool OnnxErrorIsDeviceLost(std::string_view message) {
+  if (message.empty()) {
+    return false;
+  }
+  // Lower-cased copy so the needles below can all be lower case; messages
+  // are short (a few hundred bytes) and this only runs on a failed frame.
+  std::string text(message);
+  std::transform(text.begin(), text.end(), text.begin(),
+                 [](unsigned char c) { return static_cast<char>(tolower(c)); });
+  // DXGI names as spelled by the DirectML EP and by D3D12 debug output, the
+  // plain-English wording used around GetDeviceRemovedReason, and the bare
+  // HRESULTs (which also match the "0x..." spelling):
+  //   887A0005 DXGI_ERROR_DEVICE_REMOVED
+  //   887A0006 DXGI_ERROR_DEVICE_HUNG
+  //   887A0007 DXGI_ERROR_DEVICE_RESET
+  //   887A0020 DXGI_ERROR_DRIVER_INTERNAL_ERROR
+  static constexpr const char* kNeedles[] = {
+      "dxgi_error_device_removed",
+      "dxgi_error_device_hung",
+      "dxgi_error_device_reset",
+      "dxgi_error_driver_internal_error",
+      "device removed",
+      "device was removed",
+      "device hung",
+      "device reset",
+      "device lost",
+      "lost device",
+      "887a0005",
+      "887a0006",
+      "887a0007",
+      "887a0020",
+  };
+  for (const char* needle : kNeedles) {
+    if (text.find(needle) != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool OnnxSession::Run(const std::vector<const float*>& input_data,
+                      const std::vector<std::vector<int64_t>>& input_shapes,
+                      std::vector<std::vector<float>>* out_outputs,
+                      std::vector<std::vector<int64_t>>* out_shapes,
+                      std::string* out_error) {
+  std::string error;
+  if (RunInternal(input_data, input_shapes, out_outputs, out_shapes, &error)) {
+    return true;
+  }
+  if (OnnxErrorIsDeviceLost(error)) {
+    device_lost_ = true;
+  }
+  if (out_error) {
+    *out_error = std::move(error);
+  }
+  return false;
+}
+
 #if XE_PLATFORM_WIN32
 
 OnnxRuntime* OnnxRuntime::Get(const std::filesystem::path& explicit_dir,
@@ -692,11 +750,11 @@ OnnxSession::~OnnxSession() {
   allocator_ = nullptr;
 }
 
-bool OnnxSession::Run(const std::vector<const float*>& input_data,
-                      const std::vector<std::vector<int64_t>>& input_shapes,
-                      std::vector<std::vector<float>>* out_outputs,
-                      std::vector<std::vector<int64_t>>* out_shapes,
-                      std::string* out_error) {
+bool OnnxSession::RunInternal(
+    const std::vector<const float*>& input_data,
+    const std::vector<std::vector<int64_t>>& input_shapes,
+    std::vector<std::vector<float>>* out_outputs,
+    std::vector<std::vector<int64_t>>* out_shapes, std::string* out_error) {
   if (!runtime_ || !runtime_->api() || !session_) {
     if (out_error) {
       *out_error = "session is not initialized";
@@ -862,11 +920,11 @@ std::unique_ptr<OnnxSession> OnnxSession::Create(
 
 OnnxSession::~OnnxSession() = default;
 
-bool OnnxSession::Run(const std::vector<const float*>& input_data,
-                      const std::vector<std::vector<int64_t>>& input_shapes,
-                      std::vector<std::vector<float>>* out_outputs,
-                      std::vector<std::vector<int64_t>>* out_shapes,
-                      std::string* out_error) {
+bool OnnxSession::RunInternal(
+    const std::vector<const float*>& input_data,
+    const std::vector<std::vector<int64_t>>& input_shapes,
+    std::vector<std::vector<float>>* out_outputs,
+    std::vector<std::vector<int64_t>>* out_shapes, std::string* out_error) {
   if (out_error) {
     *out_error = "ONNX Runtime is unavailable on this platform";
   }

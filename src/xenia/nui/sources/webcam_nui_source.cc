@@ -265,6 +265,11 @@ void WebcamNuiSource::UpdateStatusLocked() {
   } else if (!estimator_error_.empty()) {
     stats_.status =
         "no pose estimation (" + estimator_error_ + "); camera only";
+  } else if (estimator_health_ != PoseEstimator::BackendHealth::kOk &&
+             !estimator_status_.empty()) {
+    // The estimator lost its device and is rebuilding, or came back on the
+    // CPU; it says so itself and goes back to kOk once it has recovered.
+    stats_.status = estimator_status_ + " (" + camera_name_ + ")";
   } else {
     stats_.status = estimator_description_ + " / " + camera_name_;
   }
@@ -473,6 +478,7 @@ void WebcamNuiSource::InferenceThreadMain() {
   std::vector<PersonTracker::Assignment> assignments;
   std::string error;
   uint64_t last_error_log_us = 0;
+  PoseEstimator::BackendHealth last_health = PoseEstimator::BackendHealth::kOk;
   while (running_) {
     {
       std::unique_lock<std::mutex> lock(capture_mutex_);
@@ -505,6 +511,19 @@ void WebcamNuiSource::InferenceThreadMain() {
           XELOGW("NUI webcam: pose estimation failed: {}", error);
           last_error_log_us = start_us;
         }
+      }
+      // The estimator logs its own line per transition; the status line
+      // follows it so the UI shows a lost GPU (and the CPU fallback)
+      // without anybody having to read the log.
+      const PoseEstimator::BackendHealth health = estimator_->backend_health();
+      if (health != last_health) {
+        last_health = health;
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        estimator_health_ = health;
+        estimator_status_ = estimator_->status();
+        estimator_description_ = fmt::format(
+            "{} / {}", estimator_->backend_name(), estimator_->model_name());
+        UpdateStatusLocked();
       }
     }
     PersonTracker::Options tracker_options;

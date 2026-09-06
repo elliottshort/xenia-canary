@@ -11,8 +11,10 @@
 #define XENIA_NUI_ONNX_POSE_ESTIMATOR_H_
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -21,6 +23,72 @@
 
 namespace xe {
 namespace nui {
+
+// Decides what to do after inference fails, so a driver TDR (which takes the
+// DirectML device down and makes every later Run() fail the same way) does
+// not end tracking for the rest of the run.
+//
+// Pure logic on a caller-supplied clock: no sessions, no threads, no GPU, so
+// it is unit-tested directly. The owner feeds it RecordSuccess() /
+// RecordFailure() per frame and, while it is not healthy, calls Poll() once
+// per frame and does what it says:
+//
+//   kContinue    run the frame normally
+//   kWait        the backoff deadline has not passed; fail the frame fast
+//   kRebuildGpu  destroy and recreate the sessions on the configured
+//                provider, then report the outcome with RecordRebuildResult
+//   kRebuildCpu  same, but forced onto the CPU provider (last resort)
+//   kGiveUp      inference is not coming back this run
+//
+// Backoff is 2 s, then 5 s, then 15 s, for at most kMaxGpuAttempts DirectML
+// attempts; after that one CPU rebuild is tried and kept for the rest of the
+// run.
+class InferenceRecovery {
+ public:
+  enum class Action { kContinue, kWait, kRebuildGpu, kRebuildCpu, kGiveUp };
+  enum class State {
+    kHealthy,
+    kRecovering,   // sessions dropped, waiting to rebuild
+    kDegradedCpu,  // rebuilt on the CPU provider
+    kFailed,       // gave up
+  };
+
+  // Consecutive plain failures (no device-lost signal) that also trigger a
+  // rebuild: a wedged provider reports garbage rather than a DXGI error.
+  static constexpr uint32_t kFailureThreshold = 8;
+  static constexpr uint32_t kMaxGpuAttempts = 3;
+  static constexpr uint64_t kBackoffUs[3] = {2000000, 5000000, 15000000};
+
+  State state() const { return state_; }
+  uint32_t consecutive_failures() const { return consecutive_failures_; }
+  uint32_t gpu_attempts() const { return gpu_attempts_; }
+  // Absolute deadline of the current backoff; only meaningful while
+  // state() == kRecovering.
+  uint64_t retry_deadline_us() const { return deadline_us_; }
+
+  // A frame succeeded.
+  void RecordSuccess();
+  // A frame failed. |device_lost| when the provider said so (see
+  // OnnxErrorIsDeviceLost). Returns kWait when the caller must now drop its
+  // sessions and start the backoff, kContinue while the failure still looks
+  // transient, kGiveUp once the run is over.
+  Action RecordFailure(uint64_t now_us, bool device_lost);
+  // What to do this frame. Const: it never advances the state machine on its
+  // own, RecordRebuildResult does.
+  Action Poll(uint64_t now_us) const;
+  // Outcome of a rebuild started because Poll() asked for one. |on_cpu| must
+  // match the action (kRebuildCpu -> true).
+  void RecordRebuildResult(bool success, bool on_cpu, uint64_t now_us);
+
+ private:
+  static uint64_t BackoffUs(uint32_t attempt);
+
+  State state_ = State::kHealthy;
+  uint32_t consecutive_failures_ = 0;
+  uint32_t gpu_attempts_ = 0;
+  bool cpu_attempted_ = false;
+  uint64_t deadline_us_ = 0;
+};
 
 // MediaPipe BlazePose on ONNX Runtime.
 //
@@ -71,6 +139,8 @@ class OnnxPoseEstimator : public PoseEstimator {
   bool Process(const uint8_t* rgba, uint32_t width, uint32_t height,
                uint32_t stride, std::vector<PoseResult>* out_results,
                std::string* out_error) override;
+  BackendHealth backend_health() const override;
+  std::string status() const override;
   std::string backend_name() const override;
   std::string model_name() const override;
   double last_inference_ms() const override;
@@ -98,8 +168,20 @@ class OnnxPoseEstimator : public PoseEstimator {
  private:
   OnnxPoseEstimator() = default;
   bool Initialize(const Options& options, std::string* out_error);
+  // Loads the runtime and both models on |provider| ("auto", "dml" or
+  // "cpu") and binds their tensors. Used by Initialize and, after a lost
+  // device, by MaybeRecover on the inference thread.
+  bool BuildSessions(const std::string& provider, std::string* out_error);
+  void DestroySessions();
   bool BindDetectorTensors(std::string* out_error);
   bool BindLandmarkTensors(std::string* out_error);
+
+  // Recovery, all on the inference thread. MaybeRecover runs the state
+  // machine at the top of Process (returning false without blocking while a
+  // backoff is pending); NoteInferenceFailure classifies a failed frame.
+  bool MaybeRecover(std::string* out_error);
+  void NoteInferenceFailure(const std::string& error, std::string* out_error);
+  void PublishHealth(BackendHealth health);
 
   bool RunDetector(const uint8_t* rgba, uint32_t width, uint32_t height,
                    uint32_t stride, std::string* out_error);
@@ -113,9 +195,18 @@ class OnnxPoseEstimator : public PoseEstimator {
   OnnxRuntime* runtime_ = nullptr;
   std::unique_ptr<OnnxSession> detector_;
   std::unique_ptr<OnnxSession> landmark_;
-  std::string landmark_model_name_;
   uint32_t max_persons_ = 2;
   bool want_segmentation_ = true;
+  // Kept so the sessions can be rebuilt after a lost device.
+  Options options_;
+  InferenceRecovery recovery_;
+
+  // Written by the inference thread on a build or a health change, read by
+  // any thread through the accessors.
+  mutable std::mutex state_mutex_;
+  std::string landmark_model_name_;
+  std::string backend_name_;
+  std::atomic<BackendHealth> health_{BackendHealth::kOk};
 
   // Tensor bindings (indices into the sessions' inputs()/outputs()).
   bool detector_nchw_ = false;

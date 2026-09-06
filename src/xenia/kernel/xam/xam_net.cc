@@ -1970,9 +1970,8 @@ dword_result_t NetDll_inet_addr_entry(lpstring_t addr_ptr) {
   }
 
 #pragma warning(push)
-#pragma warning(    \
-    disable : 4996, \
-    justification : "Retain original functionality e.g. Input Notation")
+// Retain original functionality e.g. Input Notation (inet_addr is deprecated).
+#pragma warning(disable : 4996)
   uint32_t addr = inet_addr(addr_ptr);
 #pragma warning(pop)
   // https://docs.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-inet_addr#return-value

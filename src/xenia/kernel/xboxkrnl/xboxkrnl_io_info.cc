@@ -20,6 +20,14 @@
 namespace xe {
 namespace kernel {
 namespace xboxkrnl {
+bool ShouldLogFileIo(const std::string_view path);  // xboxkrnl_io.cc
+}  // namespace xboxkrnl
+}  // namespace kernel
+}  // namespace xe
+
+namespace xe {
+namespace kernel {
+namespace xboxkrnl {
 
 uint32_t GetQueryFileInfoMinimumLength(uint32_t info_class) {
   switch (info_class) {
@@ -142,6 +150,14 @@ dword_result_t NtQueryInformationFile_entry(
   if (io_status_block_ptr) {
     io_status_block_ptr->status = status;
     io_status_block_ptr->information = out_length;
+  }
+
+  if (ShouldLogFileIo(file->path())) {
+    XELOGI(
+        "[fileio] NtQueryInformationFile h={:08X} '{}' class={} len={} -> "
+        "status={:08X} out_length={}",
+        (uint32_t)file_handle, file->path(), (uint32_t)info_class,
+        (uint32_t)info_length, (uint32_t)status, out_length);
   }
 
   return status;

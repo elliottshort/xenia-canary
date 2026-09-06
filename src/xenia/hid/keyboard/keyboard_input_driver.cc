@@ -30,6 +30,12 @@ DEFINE_int32(keyboard_mode, 0,
              "controller being connected!",
              "HID");
 
+DEFINE_bool(keyboard_require_focus, true,
+            "Only report keyboard-emulated gamepad state while the emulator "
+            "window has input focus. Disable to accept key messages posted "
+            "directly to the window (input automation, remote control).",
+            "HID");
+
 DEFINE_int32(
     keyboard_user_index, 0,
     "Controller port that keyboard emulates. [0, 3] - Keyboard is assigned to "
@@ -282,7 +288,7 @@ X_RESULT KeyboardInputDriver::GetState(uint32_t user_index,
   int16_t thumb_rx = 0;
   int16_t thumb_ry = 0;
 
-  if (window()->HasFocus()) {
+  if (!cvars::keyboard_require_focus || window()->HasFocus()) {
     for (const KeyBinding& b : key_bindings_) {
       if (b.is_pressed) {
         switch (b.output_key) {

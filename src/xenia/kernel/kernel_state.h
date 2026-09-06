@@ -14,6 +14,8 @@
 #include <condition_variable>
 #include <functional>
 #include <list>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "xenia/base/bit_map.h"
@@ -240,6 +242,10 @@ class KernelState {
   bool RegisterUserModule(object_ref<UserModule> module);
   void UnregisterUserModule(UserModule* module);
   bool IsKernelModule(const std::string_view name);
+  // Loads an optional HLE kernel module (currently xbdm.xex) the first time a
+  // title imports it, so devkit builds work without --console_type. Returns
+  // true if |name| refers to a loaded kernel module afterwards.
+  bool EnsureKernelModuleLoaded(const std::string_view name);
   bool IsModuleLoaded(const std::string_view name);
   object_ref<XModule> GetModule(const std::string_view name,
                                 bool user_only = false);
@@ -409,6 +415,40 @@ class KernelState {
   std::unordered_map<XObject::Type, uint32_t>
       host_object_type_enum_to_guest_object_type_ptr_;
   uint32_t GetKernelGuestGlobals() const { return kernel_guest_globals_; }
+
+  // Object types defined by the title itself (X_OBJECT_TYPE structures that
+  // live in title memory and were passed to ObCreateObject), and the handle
+  // currently open on each instance of such an object. See XGuestObject.
+  bool IsKernelObjectType(uint32_t type_ptr) const {
+    return type_ptr >= kernel_guest_globals_ &&
+           type_ptr < kernel_guest_globals_ + sizeof(KernelGuestGlobals);
+  }
+  void RegisterTitleObjectType(uint32_t type_ptr) {
+    auto global_lock = global_critical_region_.Acquire();
+    title_object_types_.insert(type_ptr);
+  }
+  bool IsTitleObjectType(uint32_t type_ptr) {
+    auto global_lock = global_critical_region_.Acquire();
+    return title_object_types_.contains(type_ptr);
+  }
+  void RegisterTitleObjectHandle(uint32_t object_ptr, X_HANDLE handle) {
+    auto global_lock = global_critical_region_.Acquire();
+    title_object_handles_[object_ptr] = handle;
+  }
+  void UnregisterTitleObjectHandle(uint32_t object_ptr) {
+    auto global_lock = global_critical_region_.Acquire();
+    title_object_handles_.erase(object_ptr);
+  }
+  // Returns 0 if no handle is currently open on the object.
+  X_HANDLE FindTitleObjectHandle(uint32_t object_ptr) {
+    auto global_lock = global_critical_region_.Acquire();
+    auto it = title_object_handles_.find(object_ptr);
+    return it != title_object_handles_.end() ? it->second : 0;
+  }
+
+ private:
+  std::unordered_set<uint32_t> title_object_types_;
+  std::unordered_map<uint32_t, X_HANDLE> title_object_handles_;
 };
 
 }  // namespace kernel

@@ -729,6 +729,19 @@ void EmulatorApp::EmulatorThread() {
 
     fs->RegisterSymbolicLink("DEVKIT:", "\\DEVKIT");
     fs->RegisterSymbolicLink("e:", "\\DEVKIT");
+
+    // On a development kit E: is the DEVKIT folder of the HDD's first
+    // partition, and system libraries (e.g. the Kinect speech engine looking
+    // for its language packs) address it through that full device path rather
+    // than the E: link. Expose the same host folder there too; this device is
+    // registered before the game partition so it takes precedence for the
+    // DEVKIT subtree.
+    auto devkit_partition_device = std::make_unique<xe::vfs::HostPathDevice>(
+        "\\Device\\Harddisk0\\Partition1\\DEVKIT", "devkit", false);
+    if (!devkit_partition_device->Initialize() ||
+        !fs->RegisterDevice(std::move(devkit_partition_device))) {
+      XELOGE("Unable to register devkit path on the HDD partition");
+    }
   }
 
   if (cvars::mount_memory_unit) {

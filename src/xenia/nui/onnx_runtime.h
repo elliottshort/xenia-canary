@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // ONNX Runtime is loaded at runtime from a user-provided onnxruntime.dll
@@ -52,6 +53,18 @@ class OnnxRuntime {
   std::filesystem::path runtime_dir_;
 };
 
+// True when an ONNX Runtime / DirectML error message describes a lost GPU
+// device (a TDR, a driver reset or an adapter that went away) rather than a
+// model or input problem. Everything after such a failure fails the same way
+// until the sessions are rebuilt, so callers use this to decide between
+// "retry the frame" and "throw the sessions away and start over".
+//
+// The DirectML execution provider surfaces these as ORT_EP_FAIL or
+// ORT_RUNTIME_EXCEPTION statuses whose message carries the DXGI name or
+// HRESULT, so the message text is the only reliable signal. Free function so
+// it can be tested without a GPU.
+bool OnnxErrorIsDeviceLost(std::string_view message);
+
 struct OnnxTensorInfo {
   std::string name;
   std::vector<int64_t> shape;  // -1 for dynamic dimensions
@@ -89,8 +102,20 @@ class OnnxSession {
            std::vector<std::vector<int64_t>>* out_shapes,
            std::string* out_error);
 
+  // Set once a Run() failure was classified as a lost device (see
+  // OnnxErrorIsDeviceLost); never cleared, because this session cannot
+  // recover - the owner has to destroy it and create a new one.
+  bool device_lost() const { return device_lost_; }
+
  private:
   OnnxSession() = default;
+  // Run() without the device-lost bookkeeping.
+  bool RunInternal(const std::vector<const float*>& input_data,
+                   const std::vector<std::vector<int64_t>>& input_shapes,
+                   std::vector<std::vector<float>>* out_outputs,
+                   std::vector<std::vector<int64_t>>* out_shapes,
+                   std::string* out_error);
+
   OnnxRuntime* runtime_ = nullptr;
   void* session_ = nullptr;      // OrtSession*
   void* allocator_ = nullptr;    // OrtAllocator*
@@ -100,6 +125,7 @@ class OnnxSession {
   std::vector<std::string> input_names_;
   std::vector<std::string> output_names_;
   std::string provider_name_;
+  bool device_lost_ = false;
 };
 
 }  // namespace nui

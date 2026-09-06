@@ -41,6 +41,27 @@ uint32_t xeObHashObjectName(X_ANSI_STRING* ElementName, PPCContext* context) {
   return result % 0xD;
 }
 
+// Title-defined object types (see XGuestObject): returns the header of the
+// object if |object_ptr| was created through ObCreateObject with a type that
+// lives in title memory, otherwise nullptr.
+static X_OBJECT_HEADER* xeObGetTitleObjectHeader(uint32_t object_ptr) {
+  if (object_ptr < sizeof(X_OBJECT_HEADER)) {
+    return nullptr;
+  }
+  auto memory = kernel_memory();
+  uint32_t header_ptr =
+      object_ptr - static_cast<uint32_t>(sizeof(X_OBJECT_HEADER));
+  auto heap = memory->LookupHeap(header_ptr);
+  if (!heap) {
+    return nullptr;
+  }
+  auto header = memory->TranslateVirtual<X_OBJECT_HEADER*>(header_ptr);
+  if (!kernel_state()->IsTitleObjectType(header->object_type_ptr)) {
+    return nullptr;
+  }
+  return header;
+}
+
 uint32_t xeObCreateObject(X_OBJECT_TYPE* object_factory,
                           X_OBJECT_ATTRIBUTES* optional_attributes,
                           uint32_t object_size_without_headers,
@@ -48,6 +69,15 @@ uint32_t xeObCreateObject(X_OBJECT_TYPE* object_factory,
   unsigned int resulting_header_flags = 0;
   *out_object = 0;
   unsigned int poolarg = 0;
+
+  // Remember object types the title defines itself so that handles to their
+  // instances can be resolved later (ObOpenObjectByPointer & co).
+  {
+    uint32_t factory_ptr = context->HostToGuestVirtual(object_factory);
+    if (!kernel_state()->IsKernelObjectType(factory_ptr)) {
+      kernel_state()->RegisterTitleObjectType(factory_ptr);
+    }
+  }
 
   auto get_flags_and_poolarg_for_process_type = [&resulting_header_flags,
                                                  &poolarg, context]() {
@@ -209,6 +239,34 @@ DECLARE_XBOXKRNL_EXPORT1(ObOpenObjectByName, kNone, kImplemented);
 dword_result_t ObOpenObjectByPointer_entry(lpvoid_t object_ptr,
                                            lpdword_t out_handle_ptr) {
   *out_handle_ptr = 0;
+
+  // Objects of title-defined types get a wrapper that only tracks handles.
+  if (auto header = xeObGetTitleObjectHeader(object_ptr.guest_address())) {
+    auto global_lock = xe::global_critical_region::AcquireDirect();
+    X_HANDLE handle =
+        kernel_state()->FindTitleObjectHandle(object_ptr.guest_address());
+    if (handle) {
+      auto existing = kernel_state()->object_table()->LookupObject<XGuestObject>(
+          handle, true);
+      if (existing) {
+        // Another handle to the same object.
+        existing->RetainHandle();
+      } else {
+        handle = 0;
+      }
+    }
+    if (!handle) {
+      // First handle: the wrapper's table entry is the handle.
+      auto wrapper = object_ref<XGuestObject>(new XGuestObject(
+          kernel_state(), object_ptr.guest_address(), header->object_type_ptr));
+      handle = wrapper->handle();
+    }
+    header->handle_count += 1;
+    header->pointer_count += 1;
+    *out_handle_ptr = handle;
+    return X_STATUS_SUCCESS;
+  }
+
   auto object = XObject::GetNativeObject<XObject>(kernel_state(), object_ptr);
   if (!object) {
     return X_STATUS_UNSUCCESSFUL;
@@ -254,6 +312,22 @@ dword_result_t ObReferenceObjectByHandle_entry(dword_t handle,
   }
 
   uint32_t native_ptr = object->guest_object();
+
+  if (object->type() == XObject::Type::GuestObject) {
+    // Title-defined type: the type check is against the guest X_OBJECT_TYPE
+    // the object was created with, and references are counted in the guest
+    // object header like the real kernel does (released by
+    // ObDereferenceObject).
+    auto guest_object = static_cast<XGuestObject*>(object.get());
+    if (object_type_ptr && object_type_ptr != guest_object->guest_type_ptr()) {
+      return X_STATUS_OBJECT_TYPE_MISMATCH;
+    }
+    guest_object->header()->pointer_count += 1;
+    if (out_object_ptr.guest_address()) {
+      *out_object_ptr = native_ptr;
+    }
+    return X_STATUS_SUCCESS;
+  }
 
   if (object_type_ptr) {
     auto& object_types =
@@ -313,6 +387,18 @@ void xeObDereferenceObject(PPCContext* context, uint32_t native_ptr) {
     return;
   }
 
+  if (auto header = xeObGetTitleObjectHeader(native_ptr)) {
+    // Title-defined type: only the guest reference count is maintained. The
+    // object is never freed by us (its X_OBJECT_TYPE delete/free procedures
+    // are not invoked); a few bytes leak when the title tears it down, which
+    // is preferable to running title callbacks with an incomplete kernel
+    // object model.
+    if (header->pointer_count > 0) {
+      header->pointer_count -= 1;
+    }
+    return;
+  }
+
   auto object = XObject::GetNativeObject<XObject>(
       kernel_state(), kernel_memory()->TranslateVirtual(native_ptr));
   if (object) {
@@ -333,6 +419,11 @@ void ObDereferenceObject_entry(dword_t native_ptr, const ppc_context_t& ctx) {
 DECLARE_XBOXKRNL_EXPORT1(ObDereferenceObject, kNone, kImplemented);
 
 void ObReferenceObject_entry(dword_t native_ptr) {
+  if (auto header = xeObGetTitleObjectHeader(native_ptr)) {
+    header->pointer_count += 1;
+    return;
+  }
+
   // Check if a dummy value from ObReferenceObjectByHandle.
   auto object = XObject::GetNativeObject<XObject>(
       kernel_state(), kernel_memory()->TranslateVirtual(native_ptr));
@@ -432,6 +523,13 @@ dword_result_t ObCreateObject_entry(
   return result;
 }
 DECLARE_XBOXKRNL_EXPORT1(ObCreateObject, kNone, kImplemented);
+
+// BOOLEAN ObIsTitleObject(PVOID object)
+// Every object a title can reach through our HLE belongs to the title.
+dword_result_t ObIsTitleObject_entry(lpvoid_t object_ptr) {
+  return object_ptr ? 1 : 0;
+}
+DECLARE_XBOXKRNL_EXPORT1(ObIsTitleObject, kNone, kStub);
 
 }  // namespace xboxkrnl
 }  // namespace kernel

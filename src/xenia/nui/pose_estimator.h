@@ -139,6 +139,21 @@ class PoseEstimator {
                        uint32_t stride, std::vector<PoseResult>* out_results,
                        std::string* out_error) = 0;
 
+  // Backend health, for the stats line and the preview UI. Anything but kOk
+  // means Process() is failing or running slower than it should; the
+  // implementation recovers on its own where it can.
+  enum class BackendHealth {
+    kOk,
+    kRecovering,   // the inference device was lost; sessions are rebuilding
+    kDegradedCpu,  // fell back to the CPU provider after a lost device
+    kFailed,       // inference will not come back for the rest of the run
+  };
+  virtual BackendHealth backend_health() const { return BackendHealth::kOk; }
+  // One line describing a non-kOk health, empty while healthy.
+  virtual std::string status() const { return std::string(); }
+  bool degraded() const { return backend_health() != BackendHealth::kOk; }
+
+  // The provider actually in use (it changes after a fallback).
   virtual std::string backend_name() const = 0;  // e.g. "DirectML", "CPU"
   virtual std::string model_name() const = 0;    // e.g. "pose_landmark_full"
   virtual double last_inference_ms() const = 0;

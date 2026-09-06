@@ -1222,6 +1222,7 @@ bool XexModule::Unload() {
 bool XexModule::SetupLibraryImports(const std::string_view name,
                                     const xex2_import_library* library) {
   ExportResolver* kernel_resolver = nullptr;
+  kernel_state_->EnsureKernelModuleLoaded(name);
   if (kernel_state_->IsKernelModule(name)) {
     kernel_resolver = processor_->export_resolver();
   }

@@ -52,7 +52,9 @@ class WebcamNuiSource : public NuiSource {
   //   kStartingCamera  "starting camera" or "camera error: <why> (retrying)"
   //   kLoadingModels   "loading models"
   //   kCameraOnly      "no pose estimation (<why>); camera only"
-  //   kRunning         "<backend> / <model> / <camera name>"
+  //   kRunning         "<backend> / <model> / <camera name>", or, while
+  //                    the estimator is recovering from a lost GPU device,
+  //                    whatever PoseEstimator::status() reports
   enum class State {
     kStopped,
     kStartingCamera,
@@ -157,6 +159,12 @@ class WebcamNuiSource : public NuiSource {
   bool estimator_ready_ = false;       // creation finished (either way)
   std::string estimator_error_;        // empty when pose estimation works
   std::string estimator_description_;  // "<backend> / <model>"
+  // Backend health of a working estimator (a lost GPU device and the
+  // recovery that follows); the status text is the estimator's own, empty
+  // while it is healthy.
+  PoseEstimator::BackendHealth estimator_health_ =
+      PoseEstimator::BackendHealth::kOk;
+  std::string estimator_status_;
   uint64_t capture_count_ = 0;
   uint64_t capture_window_start_us_ = 0;
   uint64_t capture_window_count_ = 0;

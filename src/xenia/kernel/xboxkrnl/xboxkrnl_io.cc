@@ -7,7 +7,9 @@
  ******************************************************************************
  */
 
+#include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
+#include "xenia/base/utf8.h"
 #include "xenia/kernel/info/file.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
@@ -20,9 +22,24 @@
 #include "xenia/vfs/device.h"
 #include "xenia/xbox.h"
 
+DEFINE_string(log_file_io_filter, "",
+              "When non-empty, log NtCreateFile/NtOpenFile/NtReadFile/"
+              "NtReadFileScatter/NtQueryInformationFile calls for files whose "
+              "path contains this substring (case-insensitive). Debug aid for "
+              "titles whose streaming breaks.",
+              "Kernel");
+
 namespace xe {
 namespace kernel {
 namespace xboxkrnl {
+
+bool ShouldLogFileIo(const std::string_view path) {
+  if (cvars::log_file_io_filter.empty()) {
+    return false;
+  }
+  return xe::utf8::find_first_of_case(path, cvars::log_file_io_filter) !=
+         std::string_view::npos;
+}
 
 struct CreateOptions {
   // https://processhacker.sourceforge.io/doc/ntioapi_8h.html
@@ -106,6 +123,16 @@ dword_result_t NtCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
   }
 
   *handle_out = handle;
+
+  if (ShouldLogFileIo(target_path)) {
+    XELOGI(
+        "[fileio] NtCreateFile '{}' access={:08X} attrs={:08X} share={:08X} "
+        "disp={} options={:08X} -> status={:08X} handle={:08X} action={}",
+        target_path, (uint32_t)desired_access, (uint32_t)file_attributes,
+        (uint32_t)share_access, (uint32_t)creation_disposition,
+        (uint32_t)create_options, (uint32_t)result, handle,
+        (uint32_t)file_action);
+  }
 
   return result;
 }
@@ -211,6 +238,19 @@ dword_result_t NtReadFile_entry(dword_t file_handle, dword_t event_handle,
     ev->Set(0, false);
   }
 
+  if (file && ShouldLogFileIo(file->path())) {
+    XELOGI(
+        "[fileio] NtReadFile h={:08X} '{}' off={} len={} buf={:08X} ev={:08X} "
+        "apc={:08X} ctx={:08X} iosb={:08X} sync={} -> status={:08X} read={}",
+        (uint32_t)file_handle, file->path(),
+        byte_offset_ptr ? static_cast<int64_t>(*byte_offset_ptr) : -1,
+        (uint32_t)buffer_length, buffer.guest_address(),
+        (uint32_t)event_handle, (uint32_t)apc_routine_ptr,
+        (uint32_t)apc_context, io_status_block.guest_address(),
+        file->is_synchronous(), (uint32_t)result,
+        io_status_block ? (uint32_t)io_status_block->information : 0);
+  }
+
   return result;
 }
 DECLARE_XBOXKRNL_EXPORT2(NtReadFile, kFileSystem, kImplemented, kHighFrequency);
@@ -295,6 +335,16 @@ dword_result_t NtReadFileScatter_entry(
 
   if (ev && signal_event) {
     ev->Set(0, false);
+  }
+
+  if (file && ShouldLogFileIo(file->path())) {
+    XELOGI(
+        "[fileio] NtReadFileScatter h={:08X} '{}' off={} len={} ev={:08X} "
+        "apc={:08X} -> status={:08X}",
+        (uint32_t)file_handle, file->path(),
+        byte_offset_ptr ? static_cast<int64_t>(*byte_offset_ptr) : -1,
+        (uint32_t)length, (uint32_t)event_handle, (uint32_t)apc_routine_ptr,
+        (uint32_t)result);
   }
 
   return result;
@@ -871,6 +921,18 @@ void IoDeleteDevice_entry(pointer_t<X_DEVICE_OBJECT> device_ptr,
 }
 
 DECLARE_XBOXKRNL_EXPORT1(IoDeleteDevice, kFileSystem, kStub);
+
+// Volumes are never really mounted by the guest in our VFS (utility drive,
+// STFS packages, etc. are host backed), so dismounting is a no-op success.
+dword_result_t IoDismountVolume_entry(lpvoid_t device_object_ptr) {
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(IoDismountVolume, kFileSystem, kStub);
+
+dword_result_t IoDismountVolumeByFileHandle_entry(dword_t file_handle) {
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(IoDismountVolumeByFileHandle, kFileSystem, kStub);
 
 }  // namespace xboxkrnl
 }  // namespace kernel

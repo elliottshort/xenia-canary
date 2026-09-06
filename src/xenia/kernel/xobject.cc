@@ -155,11 +155,31 @@ object_ref<XObject> XObject::Restore(KernelState* kernel_state, Type type,
     case Type::Timer:
       break;
     case Type::Undefined:
+    case Type::GuestObject:
       break;
   }
 
   assert_always("No restore handler exists for this object!");
   return nullptr;
+}
+
+XGuestObject::XGuestObject(KernelState* kernel_state,
+                           uint32_t guest_object_ptr, uint32_t guest_type_ptr)
+    : XObject(kernel_state, kObjectType), guest_type_ptr_(guest_type_ptr) {
+  // Deliberately not SetNativePointer: that stashes our handle inside the
+  // object as if it had a dispatcher header, which would corrupt the title's
+  // data.
+  guest_object_ptr_ = guest_object_ptr;
+  kernel_state->RegisterTitleObjectHandle(guest_object_ptr, handle());
+}
+
+XGuestObject::~XGuestObject() {
+  kernel_state()->UnregisterTitleObjectHandle(guest_object());
+}
+
+X_OBJECT_HEADER* XGuestObject::header() {
+  return memory()->TranslateVirtual<X_OBJECT_HEADER*>(
+      guest_object() - static_cast<uint32_t>(sizeof(X_OBJECT_HEADER)));
 }
 
 void XObject::SetAttributes(uint32_t obj_attributes_ptr) {
