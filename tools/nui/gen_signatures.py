@@ -109,11 +109,29 @@ def count_matches(img, words, masks):
     return hits
 
 
+def hook_set_for(name):
+    """Ownership set of a NUI function; functions of a set are replaced
+    all-or-nothing. See src/xenia/nui/nui_hook_sets.h and the "Composing with
+    title-specific hooks" section of docs/nui/architecture.md. Check the guess
+    when the function is not one of the usual ones."""
+    if name in ("NuiInitialize", "NuiShutdown"):
+        return "HookSet::kLifecycle"
+    if name.startswith("NuiSkeleton") or name == "NuiTransformSmooth":
+        return "HookSet::kSkeleton"
+    if name.startswith("NuiImageStream") or name == "NuiSetFrameEndEvent":
+        return "HookSet::kImage"
+    if name.startswith("NuiCamera"):
+        return "HookSet::kCamera"
+    if name.startswith("NuiImageGet") or name.startswith("NuiTransform"):
+        return "HookSet::kTransform"
+    return "HookSet::kNone"
+
+
 def emit_cc(name, words, masks, address):
     def fmt(vals):
         return ", ".join("0x%08X" % v for v in vals)
-    return ('      {"%s", "hle", 0x%08X,\n       {%s},\n       {%s}},'
-            % (name, address, fmt(words), fmt(masks)))
+    return ('      {"%s", "hle", %s, 0x%08X,\n       {%s},\n       {%s}},'
+            % (name, hook_set_for(name), address, fmt(words), fmt(masks)))
 
 
 def emit_toml(name, words, masks):

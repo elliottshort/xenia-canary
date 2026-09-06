@@ -30,9 +30,22 @@ cpu::GuestFunction::ExternHandler LookupNuiHleHandler(std::string_view name);
 cpu::GuestFunction::ExternHandler LookupNuiTripwireHandler(
     std::string_view name);
 
-// Drops every guest resource the handlers retained (events, stream
-// tables). Called when hooks are (re)installed for a new title.
-void ResetNuiHleState(KernelState* kernel_state);
+// Drops every guest resource the handlers retained (events, stream tables,
+// the frame listener). Called when the title is terminated and when hooks
+// are (re)installed for a new title.
+//
+// |free_guest_memory| releases the pooled guest allocations that back the
+// image streams as well; only pass true while the title that owns them is
+// still the one whose memory |kernel_state| addresses, i.e. from the
+// termination path.
+void ResetNuiHleState(KernelState* kernel_state,
+                      bool free_guest_memory = false);
+
+// Declares that a title-specific hook layer owns a stateful part of the NUI
+// runtime (see nui_hle.cc). Our NuiShutdown then drops only our own guest
+// resources: tearing the device model down under an owner that never asked
+// for it costs a camera reopen and a model reload on its next frame.
+void SetNuiHleExternalOwner(bool external_owner);
 
 }  // namespace nui
 }  // namespace kernel

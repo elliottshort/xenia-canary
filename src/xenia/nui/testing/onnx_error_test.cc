@@ -58,9 +58,21 @@ TEST_CASE("OnnxErrorIsDeviceLost recognizes DirectML lost-device messages",
   CHECK(OnnxErrorIsDeviceLost("Run: hr = 0x887a0005"));
   CHECK(OnnxErrorIsDeviceLost("Run: GetDeviceRemovedReason: 887A0007"));
   CHECK(OnnxErrorIsDeviceLost("Run: 887A0020 while flushing the queue"));
-  // Plain-English wording.
+  CHECK(OnnxErrorIsDeviceLost("Run: hr = 0x887A002A"));
+  // The bare FormatMessage sentences, exactly as _com_error::ErrorMessage,
+  // std::system_category().message() and winrt::hresult_error::message()
+  // produce them: no symbolic name, no hex code, nothing to key on but the
+  // wording itself.
   CHECK(OnnxErrorIsDeviceLost(
-      "Run: the GPU device instance has been suspended, device removed"));
+      "The GPU device instance has been suspended. Use "
+      "GetDeviceRemovedReason to determine the appropriate action."));
+  CHECK(OnnxErrorIsDeviceLost(
+      "The GPU will not respond to more commands, most likely because of an "
+      "invalid command passed by the calling application."));
+  // Plain-English wording.
+  CHECK(OnnxErrorIsDeviceLost("Run: the device has been removed"));
+  CHECK(OnnxErrorIsDeviceLost(
+      "Run: DRED breadcrumbs after device removal: none"));
   CHECK(OnnxErrorIsDeviceLost("Run: The device was removed (TDR)"));
   CHECK(OnnxErrorIsDeviceLost("Run: DML device lost"));
 }
@@ -95,6 +107,19 @@ TEST_CASE("OnnxErrorIsDeviceLost ignores ordinary inference errors",
 // ---------------------------------------------------------------------------
 // InferenceRecovery
 // ---------------------------------------------------------------------------
+
+TEST_CASE("InferenceRecovery::MarkFailed ends the run", "[nui][onnx]") {
+  // The owner acts on a kGiveUp that did not come out of a rebuild (see
+  // OnnxPoseEstimator::MaybeRecover): the machine must become terminal, or
+  // the health stays "recovering" while every frame silently fails.
+  InferenceRecovery recovery = LostDevice(0);
+  recovery.MarkFailed();
+  CHECK(recovery.state() == State::kFailed);
+  CHECK(recovery.Poll(100 * kSecond) == Action::kGiveUp);
+  CHECK(recovery.RecordFailure(200 * kSecond, /*device_lost=*/true) ==
+        Action::kGiveUp);
+  CHECK(recovery.state() == State::kFailed);
+}
 
 TEST_CASE("InferenceRecovery stays out of the way while healthy",
           "[nui][onnx]") {

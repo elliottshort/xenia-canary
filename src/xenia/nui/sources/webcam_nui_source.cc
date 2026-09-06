@@ -19,6 +19,8 @@
 #include "xenia/base/logging.h"
 #include "xenia/nui/camera_model.h"
 #include "xenia/nui/nui_flags.h"
+#include "xenia/nui/onnx_pose_estimator.h"
+#include "xenia/nui/onnx_runtime.h"
 #include "xenia/nui/sources/webcam_remap_lut.h"
 
 namespace xe {
@@ -35,6 +37,11 @@ constexpr auto kCameraRetryInterval = std::chrono::seconds(3);
 // How often Stop() re-closes the camera while waiting for the capture
 // thread, in case an Open began after the previous Close.
 constexpr auto kStopPollInterval = std::chrono::milliseconds(100);
+// How long Stop() waits for the inference thread between checks, and how
+// long it waits before saying out loud that the thread is stuck inside the
+// inference provider.
+constexpr auto kStopJoinInterval = std::chrono::milliseconds(250);
+constexpr auto kStopJoinWarnAfter = std::chrono::seconds(3);
 
 uint64_t NowUs() {
   return static_cast<uint64_t>(
@@ -82,7 +89,11 @@ std::string CameraSelectorForLog() {
 
 WebcamNuiSource::WebcamNuiSource()
     : mask_lut_(std::make_unique<WebcamRemapLut>()),
-      color_lut_(std::make_unique<WebcamRemapLut>()) {}
+      color_lut_(std::make_unique<WebcamRemapLut>()) {
+  tracked_candidates_.reserve(kMaxSkeletons);
+  position_only_candidates_.reserve(kMaxSkeletons);
+  ordered_candidates_.reserve(kMaxSkeletons);
+}
 
 WebcamNuiSource::~WebcamNuiSource() { Stop(); }
 
@@ -192,16 +203,42 @@ void WebcamNuiSource::Stop() {
     capture_thread_.reset();
   }
   if (inference_thread_) {
-    // An estimator creation in progress cannot be interrupted; it finishes
-    // and the thread exits.
-    xe::threading::Wait(inference_thread_.get(), false);
+    // A pending or running session rebuild is cancelled: it calls into the
+    // provider (two CreateSession calls plus a DXGI enumeration) and can
+    // block for tens of seconds on an adapter that is still resetting, and
+    // the caller of Stop() is a guest thread inside NuiShutdown holding the
+    // device model's lock. Only a model load already inside the provider is
+    // still waited for, and that wait says so rather than going quiet.
+    if (PoseEstimator* estimator =
+            cancelable_estimator_.load(std::memory_order_acquire)) {
+      estimator->CancelRecovery();
+    }
+    auto join_start = std::chrono::steady_clock::now();
+    bool warned = false;
+    while (xe::threading::Wait(inference_thread_.get(), false,
+                               kStopJoinInterval) !=
+           xe::threading::WaitResult::kSuccess) {
+      const auto waited = std::chrono::steady_clock::now() - join_start;
+      if (!warned && waited >= kStopJoinWarnAfter) {
+        warned = true;
+        XELOGW(
+            "NUI webcam: the inference thread has not stopped after {} s; it "
+            "is inside the inference provider (a model load or a device "
+            "reset), still waiting",
+            std::chrono::duration_cast<std::chrono::seconds>(waited).count());
+      }
+    }
     inference_thread_.reset();
   }
   if (camera_) {
     camera_->Close();
     camera_.reset();
   }
+  cancelable_estimator_.store(nullptr, std::memory_order_release);
   estimator_.reset();
+  estimator_attempts_ = 0;
+  estimator_gave_up_ = false;
+  estimator_retry_at_us_ = 0;
   {
     std::lock_guard<std::mutex> lock(preview_mutex_);
     preview_valid_ = false;
@@ -261,7 +298,9 @@ void WebcamNuiSource::UpdateStatusLocked() {
                         ? std::string("starting camera")
                         : "camera error: " + camera_error_ + " (retrying)";
   } else if (!estimator_ready_) {
-    stats_.status = "loading models";
+    stats_.status = estimator_error_.empty()
+                        ? std::string("loading models")
+                        : "loading models: " + estimator_error_;
   } else if (!estimator_error_.empty()) {
     stats_.status =
         "no pose estimation (" + estimator_error_ + "); camera only";
@@ -427,9 +466,11 @@ void WebcamNuiSource::CaptureThreadMain() {
   }
 }
 
-void WebcamNuiSource::CreateEstimator() {
+bool WebcamNuiSource::CreateEstimator(const std::string& provider,
+                                      std::string* out_error) {
   // Failure leaves a camera-only source (colour stream works, nobody is
-  // ever tracked) so the user can still see the preview.
+  // ever tracked) so the user can still see the preview, unless the caller
+  // decides the failure is worth another attempt (see EnsureEstimator).
   PoseEstimator::Options estimator_options;
   if (!cvars::nui_model_path.empty()) {
     estimator_options.model_dir = cvars::nui_model_path;
@@ -438,7 +479,7 @@ void WebcamNuiSource::CreateEstimator() {
         xe::filesystem::GetExecutableFolder() / "nui" / "models";
   }
   estimator_options.quality = cvars::nui_model_quality;
-  estimator_options.execution_provider = cvars::nui_execution_provider;
+  estimator_options.execution_provider = provider;
   estimator_options.threads = cvars::nui_inference_threads;
   estimator_options.max_persons = static_cast<uint32_t>(std::clamp(
       cvars::nui_max_players, 1, static_cast<int32_t>(kMaxLandmarkPersons)));
@@ -463,16 +504,63 @@ void WebcamNuiSource::CreateEstimator() {
                                "runtime")
             : xe::path_to_utf8(cvars::nui_runtime_path));
   }
+  if (out_error) {
+    *out_error = error;
+  }
+  const bool created = estimator_ != nullptr;
   std::lock_guard<std::mutex> lock(stats_mutex_);
   estimator_ready_ = true;
-  estimator_error_ = estimator_ ? std::string() : error;
+  estimator_error_ = created ? std::string() : error;
   estimator_description_ = description;
+  UpdateStatusLocked();
+  return created;
+}
+
+void WebcamNuiSource::EnsureEstimator() {
+  if (estimator_ || estimator_gave_up_ || !running_) {
+    return;
+  }
+  const uint64_t now_us = NowUs();
+  if (estimator_retry_at_us_ && now_us < estimator_retry_at_us_) {
+    return;
+  }
+  // The last attempt is the CPU provider, exactly as it is for a device lost
+  // mid-run (see InferenceRecovery).
+  const bool on_cpu = estimator_attempts_ >= InferenceRecovery::kMaxGpuAttempts;
+  std::string error;
+  if (CreateEstimator(
+          on_cpu ? std::string("cpu") : cvars::nui_execution_provider,
+          &error)) {
+    cancelable_estimator_.store(estimator_.get(), std::memory_order_release);
+    return;
+  }
+  // A missing runtime or missing models will not fix itself; only a device
+  // that was not there yet is worth waiting for.
+  if (on_cpu || !OnnxErrorIsDeviceLost(error)) {
+    estimator_gave_up_ = true;
+    return;
+  }
+  ++estimator_attempts_;
+  const size_t backoff_index = std::min<size_t>(
+      estimator_attempts_ - 1, std::size(InferenceRecovery::kBackoffUs) - 1);
+  const uint64_t backoff_us = InferenceRecovery::kBackoffUs[backoff_index];
+  estimator_retry_at_us_ = now_us + backoff_us;
+  const bool next_is_cpu =
+      estimator_attempts_ >= InferenceRecovery::kMaxGpuAttempts;
+  XELOGW(
+      "NUI webcam: the inference device was not available while loading the "
+      "pose models ({}); retrying in {:.0f} s{}",
+      error, backoff_us / 1000000.0, next_is_cpu ? " on the CPU provider" : "");
+  std::lock_guard<std::mutex> lock(stats_mutex_);
+  // Back to "loading models", with the reason, rather than the permanent
+  // "camera only" CreateEstimator just published.
+  estimator_ready_ = false;
+  estimator_error_ =
+      fmt::format("{} (retrying in {:.0f} s)", error, backoff_us / 1000000.0);
   UpdateStatusLocked();
 }
 
 void WebcamNuiSource::InferenceThreadMain() {
-  CreateEstimator();
-
   CameraFrame work;
   std::vector<PoseResult> poses;
   std::vector<PersonTracker::Assignment> assignments;
@@ -480,6 +568,7 @@ void WebcamNuiSource::InferenceThreadMain() {
   uint64_t last_error_log_us = 0;
   PoseEstimator::BackendHealth last_health = PoseEstimator::BackendHealth::kOk;
   while (running_) {
+    EnsureEstimator();
     {
       std::unique_lock<std::mutex> lock(capture_mutex_);
       capture_cv_.wait_for(lock, std::chrono::milliseconds(kCaptureTimeoutMs),
@@ -500,10 +589,16 @@ void WebcamNuiSource::InferenceThreadMain() {
       FlipHorizontal(&work);
     }
 
+    // A Stop() that came in while the frame was being waited for must not
+    // pay for a whole inference.
+    if (!running_) {
+      break;
+    }
     const uint64_t start_us = NowUs();
-    poses.clear();
     if (estimator_) {
       error.clear();
+      // Process sizes |poses| itself and reuses the segmentation buffers
+      // already in it, so it is deliberately not cleared here.
       if (!estimator_->Process(work.rgba.data(), work.width, work.height,
                                work.stride, &poses, &error)) {
         poses.clear();
@@ -525,6 +620,8 @@ void WebcamNuiSource::InferenceThreadMain() {
             "{} / {}", estimator_->backend_name(), estimator_->model_name());
         UpdateStatusLocked();
       }
+    } else {
+      poses.clear();
     }
     PersonTracker::Options tracker_options;
     assignments = tracker_.Update(poses, work.timestamp_us, tracker_options);
@@ -598,12 +695,12 @@ void WebcamNuiSource::Synthesize(
   }
   last_synthesis_timestamp_us_ = camera_frame.timestamp_us;
 
-  struct Candidate {
-    Skeleton skeleton;
-    const PoseResult* pose;
-  };
-  std::vector<Candidate> tracked;
-  std::vector<Candidate> position_only;
+  // Members rather than locals: Candidate holds a Skeleton by value, and
+  // this runs on the inference thread once per captured frame.
+  std::vector<Candidate>& tracked = tracked_candidates_;
+  std::vector<Candidate>& position_only = position_only_candidates_;
+  tracked.clear();
+  position_only.clear();
   const size_t count = std::min(poses.size(), assignments.size());
   for (size_t i = 0; i < count; ++i) {
     const PoseResult& pose = poses[i];
@@ -630,7 +727,8 @@ void WebcamNuiSource::Synthesize(
       position_only.push_back(std::move(candidate));
     }
   }
-  std::vector<Candidate> ordered;
+  std::vector<Candidate>& ordered = ordered_candidates_;
+  ordered.clear();
   ordered.reserve(tracked.size() + position_only.size());
   for (auto& c : tracked) {
     ordered.push_back(std::move(c));

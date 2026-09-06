@@ -137,8 +137,11 @@ std::string AdapterNameForLuid(const LUID& luid) {
       SUCCEEDED(create_factory(__uuidof(IDXGIFactory1),
                                reinterpret_cast<void**>(&factory)))) {
     IDXGIAdapter1* adapter = nullptr;
-    for (UINT i = 0;
-         factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+    // Anything but S_OK (NOT_FOUND ends the enumeration, but an undocumented
+    // failure leaves *ppAdapter untouched) stops the loop: continuing would
+    // dereference a null or already released adapter, forever.
+    for (UINT i = 0; SUCCEEDED(factory->EnumAdapters1(i, &adapter)) && adapter;
+         ++i) {
       DXGI_ADAPTER_DESC1 desc;
       if (SUCCEEDED(adapter->GetDesc1(&desc)) &&
           desc.AdapterLuid.LowPart == luid.LowPart &&
@@ -148,9 +151,11 @@ std::string AdapterNameForLuid(const LUID& luid) {
             xe::to_utf8(std::u16string_view(
                 reinterpret_cast<const char16_t*>(desc.Description))));
         adapter->Release();
+        adapter = nullptr;
         break;
       }
       adapter->Release();
+      adapter = nullptr;
     }
     factory->Release();
   }
@@ -176,7 +181,10 @@ bool PathStartsWith(const std::filesystem::path& path,
 
 }  // namespace
 
-const std::string& OnnxRuntime::load_error() { return g_load_error; }
+std::string OnnxRuntime::load_error() {
+  std::lock_guard<std::mutex> lock(g_load_mutex);
+  return g_load_error;
+}
 
 bool OnnxErrorIsDeviceLost(std::string_view message) {
   if (message.empty()) {
@@ -194,13 +202,19 @@ bool OnnxErrorIsDeviceLost(std::string_view message) {
   //   887A0006 DXGI_ERROR_DEVICE_HUNG
   //   887A0007 DXGI_ERROR_DEVICE_RESET
   //   887A0020 DXGI_ERROR_DRIVER_INTERNAL_ERROR
+  //   887A002A DXGI_ERROR_ACCESS_LOST
   static constexpr const char* kNeedles[] = {
       "dxgi_error_device_removed",
       "dxgi_error_device_hung",
       "dxgi_error_device_reset",
       "dxgi_error_driver_internal_error",
+      "dxgi_error_access_lost",
       "device removed",
       "device was removed",
+      "device has been removed",
+      "device removal",
+      "device instance has been suspended",
+      "will not respond to more commands",
       "device hung",
       "device reset",
       "device lost",
@@ -209,6 +223,7 @@ bool OnnxErrorIsDeviceLost(std::string_view message) {
       "887a0006",
       "887a0007",
       "887a0020",
+      "887a002a",
   };
   for (const char* needle : kNeedles) {
     if (text.find(needle) != std::string::npos) {
@@ -599,7 +614,33 @@ std::unique_ptr<OnnxSession> OnnxSession::Create(
                              &ort_session),
           fmt::format("CreateSession({})", xe::path_to_utf8(model)).c_str(),
           &error)) {
-    return fail(error);
+    api->ReleaseSessionOptions(session_options);
+    session_options = nullptr;
+    if (want_dml && !require_dml) {
+      // Appending the DML provider succeeded, so this is the device itself
+      // (a TDR still in progress, a driver update finishing). "auto" means
+      // "the best provider that works", so try the CPU one before failing.
+      XELOGW(
+          "NUI: {} could not be created on DirectML ({}); retrying on the "
+          "CPU provider",
+          xe::path_to_utf8(model.filename()), error);
+      Options cpu_options = options;
+      cpu_options.execution_provider = "cpu";
+      std::string cpu_error;
+      std::unique_ptr<OnnxSession> cpu_session =
+          Create(runtime, model, cpu_options, &cpu_error);
+      if (cpu_session) {
+        return cpu_session;
+      }
+      if (out_error) {
+        *out_error = fmt::format("{} (CPU retry: {})", error, cpu_error);
+      }
+      return nullptr;
+    }
+    if (out_error) {
+      *out_error = error;
+    }
+    return nullptr;
   }
   api->ReleaseSessionOptions(session_options);
   session_options = nullptr;
@@ -716,6 +757,20 @@ std::unique_ptr<OnnxSession> OnnxSession::Create(
     }
   }
 
+  // Constant for the life of the session: the name arrays and the OrtValue
+  // slots are built once here so that Run() allocates nothing on the
+  // inference thread.
+  session->input_name_ptrs_.resize(input_count);
+  for (size_t i = 0; i < input_count; ++i) {
+    session->input_name_ptrs_[i] = session->input_names_[i].c_str();
+  }
+  session->output_name_ptrs_.resize(output_count);
+  for (size_t i = 0; i < output_count; ++i) {
+    session->output_name_ptrs_[i] = session->output_names_[i].c_str();
+  }
+  session->input_values_.assign(input_count, nullptr);
+  session->output_values_.assign(output_count, nullptr);
+
   std::string io_summary;
   for (const auto& input : session->inputs_) {
     io_summary +=
@@ -773,19 +828,24 @@ bool OnnxSession::RunInternal(
     return false;
   }
 
-  std::vector<OrtValue*> input_values(input_count, nullptr);
-  std::vector<OrtValue*> output_values(output_count, nullptr);
+  // The slot arrays were sized in Create() and are reused every call; the
+  // assigns below only rewrite the existing elements.
+  input_values_.assign(input_count, nullptr);
+  output_values_.assign(output_count, nullptr);
+  OrtValue** input_values = reinterpret_cast<OrtValue**>(input_values_.data());
+  OrtValue** output_values =
+      reinterpret_cast<OrtValue**>(output_values_.data());
   auto release_all = [&]() {
-    for (auto& value : input_values) {
-      if (value) {
-        api->ReleaseValue(value);
-        value = nullptr;
+    for (size_t i = 0; i < input_count; ++i) {
+      if (input_values[i]) {
+        api->ReleaseValue(input_values[i]);
+        input_values[i] = nullptr;
       }
     }
-    for (auto& value : output_values) {
-      if (value) {
-        api->ReleaseValue(value);
-        value = nullptr;
+    for (size_t i = 0; i < output_count; ++i) {
+      if (output_values[i]) {
+        api->ReleaseValue(output_values[i]);
+        output_values[i] = nullptr;
       }
     }
   };
@@ -814,19 +874,10 @@ bool OnnxSession::RunInternal(
     }
   }
 
-  std::vector<const char*> input_names(input_count);
-  for (size_t i = 0; i < input_count; ++i) {
-    input_names[i] = input_names_[i].c_str();
-  }
-  std::vector<const char*> output_names(output_count);
-  for (size_t i = 0; i < output_count; ++i) {
-    output_names[i] = output_names_[i].c_str();
-  }
-
   OrtStatus* status =
-      api->Run(static_cast<OrtSession*>(session_), nullptr, input_names.data(),
-               input_values.data(), input_count, output_names.data(),
-               output_count, output_values.data());
+      api->Run(static_cast<OrtSession*>(session_), nullptr,
+               input_name_ptrs_.data(), input_values, input_count,
+               output_name_ptrs_.data(), output_count, output_values);
   if (!CheckStatus(api, status, "Run", out_error)) {
     release_all();
     return false;

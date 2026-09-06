@@ -90,7 +90,23 @@ void NuiSystem::Resume() {
   control_cv_.notify_all();
 }
 
+void NuiSystem::SetGuestResetCallback(GuestResetCallback callback) {
+  std::lock_guard<std::mutex> lock(guest_reset_mutex_);
+  guest_reset_callback_ = std::move(callback);
+}
+
 void NuiSystem::ResetGuestState() {
+  // First, so the guest-facing layer drops the terminated title's events,
+  // stream tables and guest allocations while the kernel state they belong
+  // to is still alive. Called with no lock of this class held.
+  GuestResetCallback callback;
+  {
+    std::lock_guard<std::mutex> lock(guest_reset_mutex_);
+    callback = guest_reset_callback_;
+  }
+  if (callback) {
+    callback();
+  }
   Uninitialize();
   std::lock_guard<std::mutex> lock(state_mutex_);
   for (auto& binding : user_bindings_) {
@@ -102,23 +118,22 @@ void NuiSystem::ResetGuestState() {
   next_tracking_id_ = 1;
   tilt_target_degrees_ = 0.0f;
   tilt_current_degrees_ = 0.0f;
-  external_skeleton_consumers_ = false;
-  external_image_consumers_ = false;
+  external_consumers_ = ExternalConsumers();
   device_present_ = true;
 }
 
-void NuiSystem::SetExternalConsumers(bool skeletons, bool images) {
+void NuiSystem::SetExternalConsumers(const ExternalConsumers& consumers) {
   std::lock_guard<std::mutex> lock(state_mutex_);
-  if (external_skeleton_consumers_ == skeletons &&
-      external_image_consumers_ == images) {
+  if (external_consumers_ == consumers) {
     return;
   }
-  external_skeleton_consumers_ = skeletons;
-  external_image_consumers_ = images;
+  external_consumers_ = consumers;
   XELOGI(
-      "NUI: serving external consumers (skeletons={}, images={}); the source "
-      "produces those planes whether or not the title opened them",
-      skeletons, images);
+      "NUI: serving external consumers (skeletons={}, depth={}, "
+      "player_mask={}, color={}); the source produces those planes whether "
+      "or not the title opened them",
+      consumers.skeletons, consumers.depth, consumers.player_mask,
+      consumers.color);
   PushDeviceState();
 }
 
@@ -127,8 +142,7 @@ DeviceState NuiSystem::BuildDeviceState() const {
   DeviceState state;
   state.init_flags = init_flags_;
   state.skeleton_tracking = skeleton_enabled_;
-  state.seated_mode =
-      (skeleton_flags_ & kTrackingEnableSeatedSupport) != 0;
+  state.seated_mode = (skeleton_flags_ & kTrackingEnableSeatedSupport) != 0;
   state.near_mode = (skeleton_flags_ & kTrackingEnableInNearRange) != 0;
   for (const auto& stream : streams_) {
     if (ImageTypeIsDepth(stream.type)) {
@@ -151,15 +165,14 @@ DeviceState NuiSystem::BuildDeviceState() const {
   // title-specific hook layer instead of us (see SetExternalConsumers). Those
   // handlers read this system without ever going through the calls above, so
   // synthesize what they might read.
-  if (external_skeleton_consumers_) {
+  if (external_consumers_.skeletons) {
     state.skeleton_tracking = true;
     state.want_player_mask = true;
   }
-  if (external_image_consumers_) {
-    state.want_depth = true;
-    state.want_player_mask = true;
-    state.want_color = true;
-  }
+  state.want_depth = state.want_depth || external_consumers_.depth;
+  state.want_player_mask =
+      state.want_player_mask || external_consumers_.player_mask;
+  state.want_color = state.want_color || external_consumers_.color;
   state.tilt_degrees =
       cvars::nui_tilt_mode == "ignore" ? 0.0f : tilt_current_degrees_;
   state.camera_pitch_degrees = static_cast<float>(cvars::nui_camera_pitch);
@@ -216,14 +229,15 @@ bool NuiSystem::EnsureSourceStarted() {
 
 uint32_t NuiSystem::Initialize(uint32_t init_flags) {
   if (!is_device_present()) {
-    XELOGW("NUI: NuiInitialize(flags={:08X}) while no sensor is present "
-           "(enabled={}, present={}, source_failed={})",
-           init_flags, enabled_, device_present_.load(),
-           source_failed_.load());
+    XELOGW(
+        "NUI: NuiInitialize(flags={:08X}) while no sensor is present "
+        "(enabled={}, present={}, source_failed={})",
+        init_flags, enabled_, device_present_.load(), source_failed_.load());
     return kNuiErrorDeviceNotConnected;
   }
   if (init_flags & ~kInitKnownMask) {
-    XELOGW("NUI: NuiInitialize(flags={:08X}) has unknown flag bits", init_flags);
+    XELOGW("NUI: NuiInitialize(flags={:08X}) has unknown flag bits",
+           init_flags);
     return kNuiErrorInvalidArg;
   }
   {
@@ -310,8 +324,7 @@ bool NuiSystem::GetNextSkeletonFrame(uint32_t last_frame_number,
       // Never block forever: the emulator may be shutting down.
       publish_cv_.wait_for(lock, std::chrono::seconds(1), ready);
     } else {
-      publish_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
-                           ready);
+      publish_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms), ready);
     }
   }
   {
@@ -346,8 +359,7 @@ void NuiSystem::TransformSmooth(SkeletonFrame* frame,
 }
 
 uint32_t NuiSystem::OpenImageStream(ImageType type, ImageResolution resolution,
-                                    uint32_t stream_flags,
-                                    uint32_t frame_limit,
+                                    uint32_t stream_flags, uint32_t frame_limit,
                                     uint32_t* out_stream_id) {
   if (!out_stream_id) {
     return kNuiErrorPointer;
@@ -386,10 +398,10 @@ uint32_t NuiSystem::OpenImageStream(ImageType type, ImageResolution resolution,
   if (!initialized_) {
     return kNuiErrorDeviceNotReady;
   }
-  const uint32_t required_flag =
-      type == ImageType::kDepthAndPlayerIndex ? kInitDepthAndPlayerIndex
-      : type == ImageType::kDepth             ? kInitDepth
-                                              : kInitColor;
+  const uint32_t required_flag = type == ImageType::kDepthAndPlayerIndex
+                                     ? kInitDepthAndPlayerIndex
+                                 : type == ImageType::kDepth ? kInitDepth
+                                                             : kInitColor;
   if (!(init_flags_ & required_flag) &&
       !(is_depth && (init_flags_ & (kInitDepth | kInitDepthAndPlayerIndex)))) {
     return kNuiErrorFeatureNotInitialized;
@@ -533,8 +545,7 @@ bool NuiSystem::GetNextImageFrame(uint32_t stream_id,
   {
     std::unique_lock<std::mutex> lock(publish_mutex_);
     auto ready = [&] {
-      return frame_number_.load(std::memory_order_relaxed) >
-             last_frame_number;
+      return frame_number_.load(std::memory_order_relaxed) > last_frame_number;
     };
     if (!ready() && timeout_ms != 0) {
       auto wait = timeout_ms == 0xFFFFFFFFu
@@ -853,8 +864,8 @@ void NuiSystem::Tick() {
     // Simulated tilt motor.
     tilt_before = tilt_current_degrees_;
     if (tilt_current_degrees_ != tilt_target_degrees_) {
-      float step = kTiltSlewDegreesPerSecond * kFramePeriodMicroseconds /
-                   1000000.0f;
+      float step =
+          kTiltSlewDegreesPerSecond * kFramePeriodMicroseconds / 1000000.0f;
       float delta = tilt_target_degrees_ - tilt_current_degrees_;
       if (std::fabs(delta) <= step) {
         tilt_current_degrees_ = tilt_target_degrees_;
@@ -877,8 +888,8 @@ void NuiSystem::Tick() {
   SkeletonFrame frame;
   std::array<uint8_t, kMaxSkeletons> body_slots{};
   const auto now = std::chrono::steady_clock::now();
-  const bool stale = !have_new_source &&
-                     (now - last_source_time_) > kSourceStaleTimeout;
+  const bool stale =
+      !have_new_source && (now - last_source_time_) > kSourceStaleTimeout;
   {
     std::lock_guard<std::mutex> lock(publish_mutex_);
     if (!have_new_source) {
@@ -1046,8 +1057,7 @@ void NuiSystem::BuildSkeletonFrame(
             dst.joint_states[j] = JointState::kNotTracked;
           }
         }
-        dst.position =
-            dst.joints[static_cast<size_t>(Joint::kShoulderCenter)];
+        dst.position = dst.joints[static_cast<size_t>(Joint::kShoulderCenter)];
       }
     } else {
       dst.state = SkeletonState::kPositionOnly;
@@ -1091,8 +1101,7 @@ void NuiSystem::LogStatsIfDue() {
       stats.frames_published, stats.source_frames_consumed,
       stats.frames_repeated, stats.skeleton_reads, stats.skeleton_timeouts,
       stats.image_reads, stats.image_timeouts, stats.tracked_bodies,
-      stats.source.capture_fps, stats.source.inference_ms,
-      stats.source.status);
+      stats.source.capture_fps, stats.source.inference_ms, stats.source.status);
 }
 
 }  // namespace nui

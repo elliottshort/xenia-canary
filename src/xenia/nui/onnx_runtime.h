@@ -34,7 +34,8 @@ class OnnxRuntime {
   // nullptr when unavailable; load_error() explains why.
   static OnnxRuntime* Get(const std::filesystem::path& explicit_dir,
                           const std::filesystem::path& storage_root);
-  static const std::string& load_error();
+  // A copy, taken under the loader lock: Get() rewrites the stored string.
+  static std::string load_error();
 
   const OrtApi* api() const { return api_; }
   bool has_directml() const { return has_directml_; }
@@ -124,6 +125,13 @@ class OnnxSession {
   std::vector<OnnxTensorInfo> outputs_;
   std::vector<std::string> input_names_;
   std::vector<std::string> output_names_;
+  // Constant for the life of the session, built once in Create() so that
+  // Run() allocates nothing: the name arrays ORT wants and the OrtValue*
+  // slots (void* so the C API types stay out of this header).
+  std::vector<const char*> input_name_ptrs_;
+  std::vector<const char*> output_name_ptrs_;
+  std::vector<void*> input_values_;
+  std::vector<void*> output_values_;
   std::string provider_name_;
   bool device_lost_ = false;
 };

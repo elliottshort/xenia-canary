@@ -37,12 +37,14 @@ struct WebcamRemapLut;
 //
 // Start() only creates the two threads and returns: the camera is opened on
 // the capture thread (retried every few seconds while it is unplugged or in
-// use) and the pose estimator is created on the inference thread, so a
-// title's NuiInitialize is never stalled by device or DirectML start-up.
-// Until both are done AcquireLatest returns nullptr and GetStats().status
-// says what is happening (see State). Stop() is valid in every state and
-// interrupts a camera open in progress; an estimator creation in progress
-// is waited for (at most a couple of seconds).
+// use) and the pose estimator is created on the inference thread (retried
+// with a backoff while the inference device is unavailable), so a title's
+// NuiInitialize is never stalled by device or DirectML start-up. Until both
+// are done AcquireLatest returns nullptr and GetStats().status says what is
+// happening (see State). Stop() is valid in every state: it interrupts a
+// camera open in progress and cancels a pending or running session rebuild,
+// so the only thing it can still wait for is one model load already inside
+// the inference provider.
 //
 // Configuration comes from the nui_camera*, nui_model_*, nui_runtime_path,
 // nui_execution_provider, nui_user_scale and nui_max_players cvars.
@@ -50,7 +52,8 @@ class WebcamNuiSource : public NuiSource {
  public:
   // Start-up progress. GetStats().status carries the matching text:
   //   kStartingCamera  "starting camera" or "camera error: <why> (retrying)"
-  //   kLoadingModels   "loading models"
+  //   kLoadingModels   "loading models", or "loading models: <why>" while
+  //                    an unavailable inference device is retried
   //   kCameraOnly      "no pose estimation (<why>); camera only"
   //   kRunning         "<backend> / <model> / <camera name>", or, while
   //                    the estimator is recovering from a lost GPU device,
@@ -91,7 +94,13 @@ class WebcamNuiSource : public NuiSource {
   // Sleeps until the camera retry interval passes or Stop() is called.
   void WaitForRetry();
   void InferenceThreadMain();
-  void CreateEstimator();
+  // Creates the estimator on |provider| ("auto"/"dml"/"cpu"), publishing the
+  // outcome to the stats fields. Inference thread only.
+  bool CreateEstimator(const std::string& provider, std::string* out_error);
+  // Creates the estimator if it does not exist yet, honouring the retry
+  // backoff of a load that failed because the inference device was missing.
+  // Inference thread only.
+  void EnsureEstimator();
   std::shared_ptr<SourceFrame> AllocateFrame();
   void Synthesize(const CameraFrame& camera_frame,
                   const std::vector<PoseResult>& poses,
@@ -111,8 +120,22 @@ class WebcamNuiSource : public NuiSource {
   // the capture thread on errors and by Stop() (which is safe against an
   // Open in progress on the capture thread).
   std::unique_ptr<CameraCapture> camera_;
-  // Created and used by the inference thread only.
+  // Created and used by the inference thread only; destroyed by Stop()
+  // after the thread has been joined.
   std::unique_ptr<PoseEstimator> estimator_;
+  // The same estimator, published once it exists so that Stop() (any thread)
+  // can cancel a recovery without touching the unique_ptr. Valid from the
+  // store until the join in Stop(), which is the only place the object is
+  // destroyed.
+  std::atomic<PoseEstimator*> cancelable_estimator_{nullptr};
+  // Estimator creation retries (inference thread only). A load that failed
+  // because the inference device was missing - a TDR that just happened, a
+  // driver update finishing - is retried with the same backoff a device lost
+  // mid-run gets; anything else (no runtime, no models) fails once and stays
+  // failed.
+  uint32_t estimator_attempts_ = 0;
+  bool estimator_gave_up_ = false;
+  uint64_t estimator_retry_at_us_ = 0;
   PersonTracker tracker_;
   SkeletonSynthesizer skeleton_synthesizer_;
   DepthSynthesizer depth_synthesizer_;
@@ -141,9 +164,19 @@ class WebcamNuiSource : public NuiSource {
   // Capture timestamp of the last synthesized frame (inference thread).
   uint64_t last_synthesis_timestamp_us_ = 0;
 
-  // Synthesis scratch (inference thread only): Kinect-to-webcam pixel
-  // lookup tables and the buffers used to merge segmentation silhouettes
-  // with the capsule render.
+  // One synthesized skeleton and the pose it came from, ordered by
+  // Synthesize (fully tracked bodies first).
+  struct Candidate {
+    Skeleton skeleton;
+    const PoseResult* pose = nullptr;
+  };
+
+  // Synthesis scratch (inference thread only): the per-frame candidate
+  // lists, the Kinect-to-webcam pixel lookup tables and the buffers used to
+  // merge segmentation silhouettes with the capsule render.
+  std::vector<Candidate> tracked_candidates_;
+  std::vector<Candidate> position_only_candidates_;
+  std::vector<Candidate> ordered_candidates_;
   std::unique_ptr<WebcamRemapLut> mask_lut_;
   std::unique_ptr<WebcamRemapLut> color_lut_;
   std::vector<uint8_t> segmentation_mask_;

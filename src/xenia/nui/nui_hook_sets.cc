@@ -30,6 +30,17 @@ const char* NuiHookSetName(NuiHookSet set) {
   }
 }
 
+bool IsStatefulNuiHookSet(NuiHookSet set) {
+  switch (set) {
+    case NuiHookSet::kLifecycle:
+    case NuiHookSet::kSkeleton:
+    case NuiHookSet::kImage:
+      return true;
+    default:
+      return false;
+  }
+}
+
 bool NuiHookPlan::IsSetCeded(NuiHookSet set) const {
   for (const auto& decision : decisions) {
     if (decision.set == set && decision.status == NuiHookSetStatus::kCeded) {
@@ -108,9 +119,15 @@ NuiHookPlan PlanNuiHooks(const std::vector<NuiHookCandidate>& candidates) {
             ++plan.required_hooked_count;
           }
         }
+        if (IsStatefulNuiHookSet(decision.set)) {
+          ++plan.hooked_stateful_set_count;
+        }
         break;
       case NuiHookSetStatus::kCeded:
         ++plan.ceded_set_count;
+        if (IsStatefulNuiHookSet(decision.set)) {
+          ++plan.ceded_stateful_set_count;
+        }
         break;
       case NuiHookSetStatus::kMissing:
         ++plan.missing_set_count;

@@ -79,6 +79,9 @@ class InferenceRecovery {
   // Outcome of a rebuild started because Poll() asked for one. |on_cpu| must
   // match the action (kRebuildCpu -> true).
   void RecordRebuildResult(bool success, bool on_cpu, uint64_t now_us);
+  // Ends the run: every later Poll() returns kGiveUp. Called when the owner
+  // acts on a kGiveUp that did not come out of a rebuild.
+  void MarkFailed();
 
  private:
   static uint64_t BackoffUs(uint32_t attempt);
@@ -139,6 +142,7 @@ class OnnxPoseEstimator : public PoseEstimator {
   bool Process(const uint8_t* rgba, uint32_t width, uint32_t height,
                uint32_t stride, std::vector<PoseResult>* out_results,
                std::string* out_error) override;
+  void CancelRecovery() override;
   BackendHealth backend_health() const override;
   std::string status() const override;
   std::string backend_name() const override;
@@ -191,6 +195,9 @@ class OnnxPoseEstimator : public PoseEstimator {
                     std::string* out_error);
   void ResampleSegmentation(const PoseRegion& region, uint32_t width,
                             uint32_t height, std::vector<uint8_t>* out_mask);
+  // Takes a result's segmentation buffer back into |segmentation_pool_| so
+  // the next frame reuses it instead of allocating 75 KB per person.
+  void RecycleSegmentation(PoseResult* result);
 
   OnnxRuntime* runtime_ = nullptr;
   std::unique_ptr<OnnxSession> detector_;
@@ -200,6 +207,9 @@ class OnnxPoseEstimator : public PoseEstimator {
   // Kept so the sessions can be rebuilt after a lost device.
   Options options_;
   InferenceRecovery recovery_;
+  // Set from another thread by CancelRecovery(); read by MaybeRecover on the
+  // inference thread, which then neither waits nor rebuilds.
+  std::atomic<bool> cancel_recovery_{false};
 
   // Written by the inference thread on a build or a health change, read by
   // any thread through the accessors.
@@ -230,12 +240,23 @@ class OnnxPoseEstimator : public PoseEstimator {
   std::vector<Detection> detection_scratch_;
   std::vector<Detection> detections_;
   std::vector<float> mask_;  // 256x256 sigmoid'd segmentation of the crop
+  // Run() arguments, refilled (never reallocated) per frame so that inference
+  // does not allocate.
+  std::vector<const float*> detector_inputs_;
+  std::vector<std::vector<int64_t>> detector_input_shapes_;
+  std::vector<const float*> landmark_inputs_;
+  std::vector<std::vector<int64_t>> landmark_input_shapes_;
+  // Segmentation buffers reclaimed from the caller's results at the top of
+  // Process and handed back out in ResampleSegmentation.
+  std::vector<std::vector<uint8_t>> segmentation_pool_;
 
   // Regions being tracked, in result order; each is the crop for the next
   // frame (from the detector or from the previous landmarks).
   std::vector<PoseRegion> regions_;
   uint64_t frame_index_ = 0;
-  double last_inference_ms_ = 0.0;
+  // Written by the inference thread, read by any thread through the
+  // accessor.
+  std::atomic<double> last_inference_ms_{0.0};
 };
 
 }  // namespace nui

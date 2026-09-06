@@ -535,6 +535,13 @@ int RunPose(const DemoArgs& args) {
   CameraFrame window_frame;
   std::vector<PoseResult> window_poses;
   int exit_code = kExitOk;
+  // A lost inference device is recoverable: the estimator backs off, rebuilds
+  // and falls back to the CPU, which takes seconds. Exiting on the first
+  // failed frame would mean none of that could ever be exercised here.
+  constexpr int kFailedFrameBudget = 300;
+  int failed_frames = 0;
+  bool printed_failure = false;
+  auto last_failure_print = start;
   while (SecondsSince(start) < seconds) {
     error.clear();
     if (!camera->ReadFrame(&frame, 1000, &error)) {
@@ -554,10 +561,27 @@ int RunPose(const DemoArgs& args) {
     error.clear();
     if (!estimator->Process(frame.rgba.data(), frame.width, frame.height,
                             frame.stride, &poses, &error)) {
-      fmt::print(stderr, "error: pose estimation failed: {}\n", error);
-      exit_code = kExitModel;
-      break;
+      ++failed_frames;
+      if (!printed_failure || SecondsSince(last_failure_print) >= 2.0) {
+        printed_failure = true;
+        last_failure_print = Clock::now();
+        fmt::print(stderr, "warning: pose estimation failed: {} ({} frame{})\n",
+                   error, failed_frames, failed_frames == 1 ? "" : "s");
+      }
+      if (estimator->backend_health() ==
+              PoseEstimator::BackendHealth::kFailed ||
+          failed_frames > kFailedFrameBudget) {
+        fmt::print(stderr,
+                   "error: pose estimation failed {} frames in a row: "
+                   "{}\n",
+                   failed_frames, error);
+        exit_code = kExitModel;
+        break;
+      }
+      continue;
     }
+    failed_frames = 0;
+    printed_failure = false;
     frames_in_window++;
     total_frames++;
     inference_sum_ms += estimator->last_inference_ms();

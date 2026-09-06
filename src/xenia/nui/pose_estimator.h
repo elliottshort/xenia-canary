@@ -135,9 +135,22 @@ class PoseEstimator {
   // Processes one RGBA frame (top-down, |stride| bytes per row) and returns
   // up to max_persons results, tracked ones first. Results for people who
   // left the frame are dropped, so the vector size varies.
+  //
+  // |out_results| is cleared on every false return, so a caller that ignores
+  // the return value never republishes the previous frame's poses. The
+  // caller should hand the same vector back every frame: implementations may
+  // reuse the buffers in it (see PoseResult::segmentation) rather than
+  // reallocating them.
   virtual bool Process(const uint8_t* rgba, uint32_t width, uint32_t height,
                        uint32_t stride, std::vector<PoseResult>* out_results,
                        std::string* out_error) = 0;
+
+  // Asks a pending or in-progress backend recovery to stop and not start
+  // another one. Callable from any thread, and specifically from the thread
+  // that is shutting the estimator's owner down: a rebuild on a device that
+  // is still resetting can take tens of seconds, which a guest NuiShutdown
+  // must not wait for. A healthy estimator is unaffected.
+  virtual void CancelRecovery() {}
 
   // Backend health, for the stats line and the preview UI. Anything but kOk
   // means Process() is failing or running slower than it should; the

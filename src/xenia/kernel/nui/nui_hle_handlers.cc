@@ -91,6 +91,9 @@ struct HleState {
   uint32_t last_skeleton_frame_number = 0;
   std::vector<std::unique_ptr<HleStream>> streams;
   std::map<uint64_t, GuestBuffers> pools;
+  // A title-specific hook layer owns a stateful part of the runtime and
+  // reads the device model directly; see SetNuiHleExternalOwner.
+  bool external_owner = false;
   bool logged_first_skeleton = false;
   bool logged_first_image = false;
 };
@@ -172,8 +175,8 @@ void WriteSkeletonFrame(X_NUI_SKELETON_FRAME* dst,
                         const xe::nui::SkeletonFrame& src) {
   const NuiHleQuirks& quirks = GetActiveNuiHleQuirks();
   std::memset(dst, 0, sizeof(*dst));
-  dst->timestamp = quirks.timestamp_100ns ? src.timestamp_us * 10
-                                          : src.timestamp_us / 1000;
+  dst->timestamp =
+      quirks.timestamp_100ns ? src.timestamp_us * 10 : src.timestamp_us / 1000;
   dst->frame_number = src.frame_number;
   dst->flags = src.flags;
   xe::nui::Vec4 floor = src.floor_clip_plane;
@@ -287,8 +290,8 @@ bool AllocateStreamBuffers(KernelState* kernel_state, HleState& state,
   stream->width = xe::nui::ImageResolutionWidth(stream->resolution);
   stream->height = xe::nui::ImageResolutionHeight(stream->resolution);
   stream->bytes_per_pixel = xe::nui::ImageTypeIsDepth(stream->type) ? 2 : 4;
-  stream->pitch = xe::align(stream->width * stream->bytes_per_pixel,
-                            kTextureRowAlignment);
+  stream->pitch =
+      xe::align(stream->width * stream->bytes_per_pixel, kTextureRowAlignment);
   stream->slot_bytes =
       xe::align(stream->pitch * stream->height, kPixelBufferAlignment);
 
@@ -304,9 +307,9 @@ bool AllocateStreamBuffers(KernelState* kernel_state, HleState& state,
         stream->frame_limit * uint32_t(sizeof(X_NUI_IMAGE_FRAME)), 0x40);
     buffers.textures_ptr = memory->SystemHeapAlloc(
         stream->frame_limit * uint32_t(sizeof(X_D3D_TEXTURE)), 0x40);
-    buffers.pixels_ptr = memory->SystemHeapAlloc(
-        stream->frame_limit * stream->slot_bytes, kPixelBufferAlignment,
-        kSystemHeapPhysical);
+    buffers.pixels_ptr =
+        memory->SystemHeapAlloc(stream->frame_limit * stream->slot_bytes,
+                                kPixelBufferAlignment, kSystemHeapPhysical);
     if (!buffers.descriptors_ptr || !buffers.textures_ptr ||
         !buffers.pixels_ptr) {
       XELOGE("NuiHLE: failed to allocate guest memory for an image stream");
@@ -346,13 +349,13 @@ bool AllocateStreamBuffers(KernelState* kernel_state, HleState& state,
 void FillSlot(KernelState* kernel_state, HleStream* stream, uint32_t slot,
               const xe::nui::ImageFrame& frame) {
   Memory* memory = kernel_state->memory();
-  uint8_t* pixels = memory->TranslateVirtual(stream->pixels_ptr +
-                                             slot * stream->slot_bytes);
+  uint8_t* pixels =
+      memory->TranslateVirtual(stream->pixels_ptr + slot * stream->slot_bytes);
   const NuiHleQuirks& quirks = GetActiveNuiHleQuirks();
   if (xe::nui::ImageTypeIsDepth(stream->type)) {
     const bool distinct_overflow =
-        (stream->scratch.flags &
-         xe::nui::kStreamDistinctOverflowDepthValues) != 0;
+        (stream->scratch.flags & xe::nui::kStreamDistinctOverflowDepthValues) !=
+        0;
     for (uint32_t y = 0; y < stream->height; ++y) {
       uint8_t* row = pixels + y * stream->pitch;
       for (uint32_t x = 0; x < stream->width; ++x) {
@@ -364,10 +367,9 @@ void FillSlot(KernelState* kernel_state, HleStream* stream, uint32_t slot,
         if (depth == 0) {
           packed = 0;
         } else if (depth > xe::nui::kDepthMaxMillimetres) {
-          packed = distinct_overflow
-                       ? uint16_t(xe::nui::kDepthTooFar
-                                  << xe::nui::kPlayerIndexBits)
-                       : 0;
+          packed = distinct_overflow ? uint16_t(xe::nui::kDepthTooFar
+                                                << xe::nui::kPlayerIndexBits)
+                                     : 0;
         } else {
           packed = uint16_t((depth << xe::nui::kPlayerIndexBits) |
                             (player & xe::nui::kPlayerIndexMask));
@@ -420,9 +422,10 @@ void NuiInitialize(PPCContext* ctx, KernelState* kernel_state) {
     static bool logged = false;
     if (!logged) {
       logged = true;
-      XELOGW("NuiHLE: NuiInitialize({:08X}) rejected: unknown flag bits "
-             "(accepted mask {:08X})",
-             flags, quirks.init_flags_mask);
+      XELOGW(
+          "NuiHLE: NuiInitialize({:08X}) rejected: unknown flag bits "
+          "(accepted mask {:08X})",
+          flags, quirks.init_flags_mask);
     }
     Return(ctx, xe::nui::kNuiErrorInvalidArg);
     return;
@@ -459,9 +462,11 @@ void NuiInitialize(PPCContext* ctx, KernelState* kernel_state) {
 void NuiShutdown(PPCContext* ctx, KernelState* kernel_state) {
   Trace("NuiShutdown", ctx, 0);
   auto* nui = NuiSystemOf(ctx);
+  bool external_owner = false;
   {
     auto& state = State();
     std::lock_guard<std::mutex> lock(state.mutex);
+    external_owner = state.external_owner;
     for (auto& stream : state.streams) {
       if (nui) {
         nui->CloseImageStream(stream->system_stream_id);
@@ -471,8 +476,16 @@ void NuiShutdown(PPCContext* ctx, KernelState* kernel_state) {
     state.skeleton_event.reset();
     state.frame_end_event.reset();
   }
-  if (nui) {
+  if (nui && !external_owner) {
     nui->Uninitialize();
+  } else if (nui) {
+    // Somebody else owns a stateful part of the runtime and reads the device
+    // model without going through us: stopping it here would reopen the
+    // camera and reload the inference models on that owner's next frame,
+    // seconds of work on a guest thread. Only our own resources are dropped.
+    XELOGI(
+        "NuiHLE: NuiShutdown: the device model stays up for the title hooks "
+        "that own part of the runtime");
   }
   Return(ctx, xe::nui::kNuiOk);
 }
@@ -484,11 +497,10 @@ void NuiSkeletonTrackingEnable(PPCContext* ctx, KernelState* kernel_state) {
   const uint32_t event_handle = Arg(ctx, 0);
   const uint32_t flags = Arg(ctx, 1);
   const NuiHleQuirks& quirks = GetActiveNuiHleQuirks();
-  constexpr uint32_t kKnownFlags =
-      xe::nui::kTrackingSuppressNoFrameData |
-      xe::nui::kTrackingTitleSetsTrackedSkeletons |
-      xe::nui::kTrackingEnableSeatedSupport |
-      xe::nui::kTrackingEnableInNearRange;
+  constexpr uint32_t kKnownFlags = xe::nui::kTrackingSuppressNoFrameData |
+                                   xe::nui::kTrackingTitleSetsTrackedSkeletons |
+                                   xe::nui::kTrackingEnableSeatedSupport |
+                                   xe::nui::kTrackingEnableInNearRange;
   if (!nui) {
     Return(ctx, xe::nui::kNuiErrorDeviceNotConnected);
     return;
@@ -574,8 +586,7 @@ void NuiSkeletonGetNextFrame(PPCContext* ctx, KernelState* kernel_state) {
              frame.frame_number);
     }
   }
-  if (nui->skeleton_tracking_flags() &
-      xe::nui::kTrackingSuppressNoFrameData) {
+  if (nui->skeleton_tracking_flags() & xe::nui::kTrackingSuppressNoFrameData) {
     bool anybody = false;
     for (const auto& skeleton : frame.skeletons) {
       if (skeleton.state != xe::nui::SkeletonState::kNotTracked) {
@@ -629,8 +640,8 @@ void NuiTransformSmooth(PPCContext* ctx, KernelState* kernel_state) {
   xe::nui::SmoothParameters params;
   const xe::nui::SmoothParameters* params_ptr_host = nullptr;
   if (params_ptr) {
-    auto* p = ctx->TranslateVirtual<X_NUI_TRANSFORM_SMOOTH_PARAMETERS*>(
-        params_ptr);
+    auto* p =
+        ctx->TranslateVirtual<X_NUI_TRANSFORM_SMOOTH_PARAMETERS*>(params_ptr);
     params.smoothing = p->smoothing;
     params.correction = p->correction;
     params.prediction = p->prediction;
@@ -644,7 +655,8 @@ void NuiTransformSmooth(PPCContext* ctx, KernelState* kernel_state) {
       continue;
     }
     for (uint32_t j = 0; j < kGuestJointCount; ++j) {
-      WriteVector4(&guest->skeletons[i].joints[j], frame.skeletons[i].joints[j]);
+      WriteVector4(&guest->skeletons[i].joints[j],
+                   frame.skeletons[i].joints[j]);
     }
   }
   Return(ctx, xe::nui::kNuiOk);
@@ -668,8 +680,8 @@ void NuiImageStreamOpen(PPCContext* ctx, KernelState* kernel_state) {
     Return(ctx, xe::nui::kNuiErrorInvalidArg);
     return;
   }
-  xe::store_and_swap<uint32_t>(
-      ctx->TranslateVirtual<uint8_t*>(out_handle_ptr), 0);
+  xe::store_and_swap<uint32_t>(ctx->TranslateVirtual<uint8_t*>(out_handle_ptr),
+                               0);
   if (!nui) {
     Return(ctx, xe::nui::kNuiErrorDeviceNotConnected);
     return;
@@ -721,15 +733,16 @@ void NuiImageStreamOpen(PPCContext* ctx, KernelState* kernel_state) {
     Return(ctx, xe::nui::kNuiErrorDeviceNotReady);
     return;
   }
-  xe::store_and_swap<uint32_t>(
-      ctx->TranslateVirtual<uint8_t*>(out_handle_ptr), stream->handle);
+  xe::store_and_swap<uint32_t>(ctx->TranslateVirtual<uint8_t*>(out_handle_ptr),
+                               stream->handle);
   XELOGI("NuiHLE: image stream opened: handle {:08X} type {} resolution {}",
          stream->handle, type, resolution);
   state.streams.push_back(std::move(stream));
   Return(ctx, xe::nui::kNuiOk);
 }
 
-// HRESULT NuiImageStreamGetNextFrame(HANDLE hStream, DWORD dwMillisecondsToWait,
+// HRESULT NuiImageStreamGetNextFrame(HANDLE hStream, DWORD
+// dwMillisecondsToWait,
 //                                    const NUI_IMAGE_FRAME** ppcImageFrame)
 void NuiImageStreamGetNextFrame(PPCContext* ctx, KernelState* kernel_state) {
   Trace("NuiImageStreamGetNextFrame", ctx, 3);
@@ -847,8 +860,8 @@ void NuiImageStreamSetImageFrameFlags(PPCContext* ctx,
   auto& state = State();
   std::lock_guard<std::mutex> lock(state.mutex);
   HleStream* stream = FindStream(state, handle);
-  if (!stream || !nui || !nui->SetImageStreamFlags(stream->system_stream_id,
-                                                   flags)) {
+  if (!stream || !nui ||
+      !nui->SetImageStreamFlags(stream->system_stream_id, flags)) {
     Return(ctx, xe::nui::kNuiErrorInvalidArg);
     return;
   }
@@ -871,12 +884,17 @@ void NuiImageStreamGetImageFrameFlags(PPCContext* ctx,
     Return(ctx, xe::nui::kNuiErrorInvalidArg);
     return;
   }
-  xe::store_and_swap<uint32_t>(ctx->TranslateVirtual<uint8_t*>(out_ptr),
-                               flags);
+  xe::store_and_swap<uint32_t>(ctx->TranslateVirtual<uint8_t*>(out_ptr), flags);
   Return(ctx, xe::nui::kNuiOk);
 }
 
 // HRESULT NuiSetFrameEndEvent(HANDLE hEvent, DWORD dwFrameEventFlag)
+//
+// The event this arms is signalled by our pacer (OnFramePublished), not by
+// an image stream, so its state is global and it belongs in HookSet::kNone
+// rather than in the image set: a title whose image set is ceded but whose
+// skeleton set is ours still needs it. No signature table has an entry for
+// it yet; see docs/nui/architecture.md.
 void NuiSetFrameEndEvent(PPCContext* ctx, KernelState* kernel_state) {
   Trace("NuiSetFrameEndEvent", ctx, 2);
   const uint32_t event_handle = Arg(ctx, 0);
@@ -966,12 +984,29 @@ void NuiImageGetColorPixelCoordinatesFromDepthPixel(PPCContext* ctx,
     Return(ctx, xe::nui::kNuiErrorInvalidArg);
     return;
   }
+  // The depth coordinates are in whatever resolution the title opened its
+  // depth stream at (80x60 and 160x120 are accepted), not in the working
+  // resolution of the pipeline.
+  uint32_t depth_width = xe::nui::kDepthWidth;
+  uint32_t depth_height = xe::nui::kDepthHeight;
+  {
+    auto& state = State();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    for (const auto& stream : state.streams) {
+      if (xe::nui::ImageTypeIsDepth(stream->type) && stream->width &&
+          stream->height) {
+        depth_width = stream->width;
+        depth_height = stream->height;
+        break;
+      }
+    }
+  }
   // The synthesized colour and depth images share one point of view, so the
   // mapping is a pure resolution scale.
-  const int32_t color_x =
-      depth_x * static_cast<int32_t>(color_width) / xe::nui::kDepthWidth;
-  const int32_t color_y =
-      depth_y * static_cast<int32_t>(color_height) / xe::nui::kDepthHeight;
+  const int32_t color_x = depth_x * static_cast<int32_t>(color_width) /
+                          static_cast<int32_t>(depth_width);
+  const int32_t color_y = depth_y * static_cast<int32_t>(color_height) /
+                          static_cast<int32_t>(depth_height);
   xe::store_and_swap<int32_t>(ctx->TranslateVirtual<uint8_t*>(out_x), color_x);
   xe::store_and_swap<int32_t>(ctx->TranslateVirtual<uint8_t*>(out_y), color_y);
   Return(ctx, xe::nui::kNuiOk);
@@ -1005,22 +1040,14 @@ const HandlerEntry kHandlers[] = {
 
 // Tripwires: known API surface we do not emulate yet.
 constexpr const char* kTripwireNames[] = {
-    "NuiSpeechEnable",
-    "NuiSpeechLoadGrammarFromMemory",
-    "NuiSpeechStartRecognition",
-    "NuiSpeechStopRecognition",
-    "NuiSpeechUnloadGrammar",
-    "NuiSpeechSetEventInterest",
-    "NuiSpeechGetEvents",
-    "NuiSpeechDestroyEvent",
-    "NuiHandsInitialize",
-    "NuiHandsReset",
-    "NuiHandsShutdown",
-    "NuiIdentityEnroll",
-    "NuiIdentityIdentify",
-    "NuiSkeletonCalculateBoneOrientations",
-    "NuiAudioMicArrayStart",
-    "NuiAudioMicArrayStop",
+    "NuiSpeechEnable",           "NuiSpeechLoadGrammarFromMemory",
+    "NuiSpeechStartRecognition", "NuiSpeechStopRecognition",
+    "NuiSpeechUnloadGrammar",    "NuiSpeechSetEventInterest",
+    "NuiSpeechGetEvents",        "NuiSpeechDestroyEvent",
+    "NuiHandsInitialize",        "NuiHandsReset",
+    "NuiHandsShutdown",          "NuiIdentityEnroll",
+    "NuiIdentityIdentify",       "NuiSkeletonCalculateBoneOrientations",
+    "NuiAudioMicArrayStart",     "NuiAudioMicArrayStop",
 };
 constexpr size_t kTripwireCount =
     sizeof(kTripwireNames) / sizeof(kTripwireNames[0]);
@@ -1044,7 +1071,8 @@ MakeTripwires(std::index_sequence<I...>) {
   return {{&Tripwire<I>...}};
 }
 
-const auto kTripwires = MakeTripwires(std::make_index_sequence<kTripwireCount>{});
+const auto kTripwires =
+    MakeTripwires(std::make_index_sequence<kTripwireCount>{});
 
 }  // namespace
 
@@ -1067,20 +1095,51 @@ cpu::GuestFunction::ExternHandler LookupNuiTripwireHandler(
   return nullptr;
 }
 
-void ResetNuiHleState(KernelState* kernel_state) {
+void SetNuiHleExternalOwner(bool external_owner) {
   auto& state = State();
   std::lock_guard<std::mutex> lock(state.mutex);
+  state.external_owner = external_owner;
+}
+
+void ResetNuiHleState(KernelState* kernel_state, bool free_guest_memory) {
+  auto& state = State();
   auto* nui = kernel_state->emulator()->nui_system();
-  if (nui && state.listener_id) {
-    nui->RemoveFrameListener(state.listener_id);
+  uint32_t listener_id = 0;
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    listener_id = state.listener_id;
+    state.listener_id = 0;
   }
-  state.listener_id = 0;
+  // Outside state.mutex: the pacer holds its listener list while it calls
+  // OnFramePublished, which takes state.mutex.
+  if (nui && listener_id) {
+    nui->RemoveFrameListener(listener_id);
+  }
+  std::lock_guard<std::mutex> lock(state.mutex);
   state.kernel_state = kernel_state;
   state.skeleton_event.reset();
   state.frame_end_event.reset();
   state.last_skeleton_frame_number = 0;
   state.streams.clear();
-  // Guest memory belongs to the terminated title's process; forget it.
+  state.external_owner = false;
+  if (free_guest_memory) {
+    // The title that owns these is being terminated and its memory is still
+    // ours to release; a colour stream is up to 4 * 640 * 480 * 4 bytes of
+    // guest physical memory, which would otherwise stay allocated for the
+    // rest of the process.
+    Memory* memory = kernel_state->memory();
+    for (auto& entry : state.pools) {
+      if (entry.second.descriptors_ptr) {
+        memory->SystemHeapFree(entry.second.descriptors_ptr);
+      }
+      if (entry.second.textures_ptr) {
+        memory->SystemHeapFree(entry.second.textures_ptr);
+      }
+      if (entry.second.pixels_ptr) {
+        memory->SystemHeapFree(entry.second.pixels_ptr);
+      }
+    }
+  }
   state.pools.clear();
   state.logged_first_skeleton = false;
   state.logged_first_image = false;

@@ -49,6 +49,13 @@ enum class NuiHookSet {
 // Short human-readable name used in logs, e.g. "image stream".
 const char* NuiHookSetName(NuiHookSet set);
 
+// Whether a group carries the state a title needs served for its Kinect to
+// work at all: the initialized flag, the skeleton frame cursor, the image
+// streams. The tilt motor, the pure transforms and standalone helpers do
+// not qualify - serving only those means the title still talks to a runtime
+// with no sensor behind it.
+bool IsStatefulNuiHookSet(NuiHookSet set);
+
 // One resolved (or unresolved) NUI runtime function, as the input of the
 // ownership decision.
 struct NuiHookCandidate {
@@ -101,6 +108,11 @@ struct NuiHookPlan {
   uint32_t required_hooked_count = 0;
   uint32_t ceded_set_count = 0;
   uint32_t missing_set_count = 0;
+  // Of the above, the groups that are stateful (see IsStatefulNuiHookSet).
+  // The device-present decision is made on these: a standalone ceded helper
+  // or a lone coordinate transform is not a served sensor.
+  uint32_t hooked_stateful_set_count = 0;
+  uint32_t ceded_stateful_set_count = 0;
 
   // Whether the candidate at |index| is one of ours to install.
   bool ShouldHook(size_t index) const {

@@ -102,13 +102,32 @@ class NuiSystem {
   // NUI library version, so the title takes its "no sensor" path.
   void SetDevicePresent(bool present) { device_present_ = present; }
 
-  // Declares that code outside the guest-facing NUI layer (a title-specific
-  // hook layer that owns part of the runtime, see kernel/nui/nui_hle.cc)
-  // reads skeletons or images from this system directly, without calling
-  // Initialize / EnableSkeletonTracking / OpenImageStream. The source is
-  // then asked for those planes unconditionally, so a foreign handler never
-  // finds them empty. Cleared by ResetGuestState.
-  void SetExternalConsumers(bool skeletons, bool images);
+  // What code outside the guest-facing NUI layer (a title-specific hook
+  // layer that owns part of the runtime, see kernel/nui/nui_hle.cc) reads
+  // from this system directly, without calling Initialize /
+  // EnableSkeletonTracking / OpenImageStream.
+  //
+  // Per plane rather than per set: producing a plane nobody reads costs a
+  // depth render, a segmentation blend or a 640x480 colour resample on the
+  // capture thread of every frame, so the caller says exactly what the
+  // foreign owner can read.
+  struct ExternalConsumers {
+    bool skeletons = false;
+    bool depth = false;
+    bool player_mask = false;
+    bool color = false;
+    bool operator==(const ExternalConsumers& other) const = default;
+  };
+  // The declared planes are asked of the source unconditionally, so a
+  // foreign handler never finds them empty. Cleared by ResetGuestState.
+  void SetExternalConsumers(const ExternalConsumers& consumers);
+
+  // Invoked by ResetGuestState (title termination), before anything else and
+  // outside every lock of this class, so the guest-facing layer can drop the
+  // guest resources it holds for the terminated title. Only one callback is
+  // kept; pass an empty function to clear it.
+  using GuestResetCallback = std::function<void()>;
+  void SetGuestResetCallback(GuestResetCallback callback);
 
   // Title lifecycle (NuiInitialize / NuiShutdown).
   uint32_t Initialize(uint32_t init_flags);
@@ -233,9 +252,8 @@ class NuiSystem {
   std::atomic<bool> skeleton_enabled_{false};
   uint32_t skeleton_flags_ = 0;
   // Set by SetExternalConsumers: a foreign owner of part of the NUI runtime
-  // may read skeletons/images without setting the state above.
-  bool external_skeleton_consumers_ = false;
-  bool external_image_consumers_ = false;
+  // may read these planes without setting the state above.
+  ExternalConsumers external_consumers_;
   uint32_t title_tracked_ids_[kMaxTrackedSkeletons] = {0, 0};
   std::vector<ImageStream> streams_;
   uint32_t next_stream_id_ = 1;
@@ -272,6 +290,9 @@ class NuiSystem {
 
   HoltSmoother smoother_;
   std::mutex smoother_mutex_;
+
+  mutable std::mutex guest_reset_mutex_;
+  GuestResetCallback guest_reset_callback_;
 
   mutable std::mutex stats_mutex_;
   Stats stats_;

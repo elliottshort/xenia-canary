@@ -194,6 +194,36 @@ TEST_CASE("An optional entry inside a set does not spoil it", "[nui]") {
       plan.ShouldHook(IndexOf(candidates, "NuiImageStreamSetImageFrameFlags")));
 }
 
+TEST_CASE("Only stateful sets count as a served sensor", "[nui]") {
+  // A standalone helper owned by title hooks, a pure coordinate transform of
+  // ours, and no skeleton set: the title has no Kinect, whatever the raw
+  // hooked/ceded counts say.
+  std::vector<NuiHookCandidate> candidates = {
+      Theirs("NuiHandsGetFrame", NuiHookSet::kNone, 0x82C60000),
+      Ours("NuiImageGetColorPixelCoordinatesFromDepthPixel",
+           NuiHookSet::kTransform, 0x82C61000),
+      NotFound("NuiSkeletonGetNextFrame", NuiHookSet::kSkeleton),
+  };
+  const NuiHookPlan plan = PlanNuiHooks(candidates);
+  CHECK(plan.ceded_set_count == 1);
+  CHECK(plan.required_hooked_count == 1);
+  CHECK(plan.ceded_stateful_set_count == 0);
+  CHECK(plan.hooked_stateful_set_count == 0);
+}
+
+TEST_CASE("Stateful sets are counted whoever owns them", "[nui]") {
+  std::vector<NuiHookCandidate> candidates = FullTable();
+  // The image set goes to a title hook layer, the rest stays ours.
+  candidates[IndexOf(candidates, "NuiImageStreamGetNextFrame")].already_hooked =
+      true;
+  const NuiHookPlan plan = PlanNuiHooks(candidates);
+  CHECK(plan.ceded_stateful_set_count == 1);
+  // Lifecycle and skeleton; the camera set is not stateful.
+  CHECK(plan.hooked_stateful_set_count == 2);
+  CHECK(plan.IsSetHooked(NuiHookSet::kLifecycle));
+  CHECK(plan.IsSetCeded(NuiHookSet::kImage));
+}
+
 TEST_CASE("Nothing left for us when every set is taken or missing", "[nui]") {
   std::vector<NuiHookCandidate> candidates = {
       Theirs("NuiSkeletonGetNextFrame", NuiHookSet::kSkeleton, 0x82C66C10),
